@@ -1,0 +1,8 @@
+{
+  "total_examples": 13564,
+  "with_images": 3000,
+  "text_only": 10564,
+  "train": 10851,
+  "val": 1356,
+  "test": 1357
+}

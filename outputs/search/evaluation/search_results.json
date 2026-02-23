@@ -1,0 +1,42 @@
+{
+  "BM25": {
+    "ndcg@5": 0.7343,
+    "ndcg@10": 0.7651,
+    "ndcg@20": 0.8629,
+    "mrr": 0.8681,
+    "num_queries": 72,
+    "latency_p50_ms": 32.8,
+    "latency_p95_ms": 77.9,
+    "latency_p99_ms": 90.8
+  },
+  "Bi-Encoder": {
+    "ndcg@5": 0.6038,
+    "ndcg@10": 0.6418,
+    "ndcg@20": 0.7466,
+    "mrr": 0.763,
+    "num_queries": 72,
+    "latency_p50_ms": 7.0,
+    "latency_p95_ms": 7.7,
+    "latency_p99_ms": 163.4
+  },
+  "Bi + Cross-Encoder": {
+    "ndcg@5": 0.7632,
+    "ndcg@10": 0.8159,
+    "ndcg@20": 0.8159,
+    "mrr": 0.8303,
+    "num_queries": 72,
+    "latency_p50_ms": 39.4,
+    "latency_p95_ms": 50.3,
+    "latency_p99_ms": 66.9
+  },
+  "Full Pipeline": {
+    "ndcg@5": 0.7646,
+    "ndcg@10": 0.817,
+    "ndcg@20": 0.817,
+    "mrr": 0.8303,
+    "num_queries": 72,
+    "latency_p50_ms": 39.2,
+    "latency_p95_ms": 44.2,
+    "latency_p99_ms": 48.3
+  }
+}

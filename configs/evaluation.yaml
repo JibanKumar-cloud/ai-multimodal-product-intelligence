@@ -1,0 +1,47 @@
+# Evaluation Configuration
+
+metrics:
+  primary:
+    - "attribute_f1"                    # Per-attribute F1 score
+    - "exact_match"                     # Full JSON exact match rate
+    - "weighted_f1"                     # F1 weighted by attribute importance
+  
+  secondary:
+    - "precision_per_attr"              # Per-attribute precision
+    - "recall_per_attr"                 # Per-attribute recall
+    - "cost_per_1k"                     # Cost per 1000 products processed
+    - "latency_p50"                     # Median latency
+    - "latency_p99"                     # 99th percentile latency
+
+attributes:
+  # Attributes to evaluate and their types
+  style:
+    type: "categorical"
+    weight: 1.5                         # Higher weight — hardest attribute
+  primary_material:
+    type: "categorical"
+    weight: 1.2
+  color_family:
+    type: "categorical"
+    weight: 1.0
+  room_type:
+    type: "multi_label"                 # Can have multiple values
+    weight: 1.0
+  product_type:
+    type: "categorical"
+    weight: 1.3
+
+error_analysis:
+  enabled: true
+  num_failure_examples: 50              # Top N failures to analyze
+  slice_by:                             # Slice results by these dimensions
+    - "product_class"
+    - "attribute_type"
+    - "query_complexity"                # Simple vs. ambiguous products
+
+output:
+  results_dir: "outputs/evaluation"
+  report_format: ["markdown", "json", "csv"]
+  generate_plots: true
+  plot_format: "png"
+  dpi: 150

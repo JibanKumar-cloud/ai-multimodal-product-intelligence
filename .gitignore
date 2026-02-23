@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+env/
+
+# Model checkpoints (too large for git)
+outputs/checkpoints/
+outputs/search/embeddings/
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+
+# FAISS index
+*.index
+
+# Data (download via scripts)
+data/raw/
+data/images/
+data/enriched_catalog.jsonl
+data/search/*.jsonl
+
+# Keep processed data structure
+!data/processed/.gitkeep
+!data/search/.gitkeep
+
+# Logs and cache
+outputs/logs/
+outputs/cache/
+outputs/predictions/
+outputs/evaluation/
+wandb/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Streamlit
+.streamlit/
+
+# Misc
+*.npy
+*.npz

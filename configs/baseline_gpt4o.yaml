@@ -1,0 +1,42 @@
+# GPT-4o Baseline Configuration
+# Used to establish upper-bound quality benchmark
+
+model:
+  name: "gpt-4o"
+  temperature: 0.0                      # Deterministic for reproducibility
+  max_tokens: 500
+  top_p: 1.0
+
+prompting:
+  strategy: "zero_shot"                 # Options: zero_shot, few_shot
+  num_few_shot_examples: 5              # Only used if strategy=few_shot
+  
+  system_prompt: |
+    You are a product catalog specialist for a home goods/furniture retailer.
+    Your task is to extract structured product attributes from a product listing.
+    
+    You must return ONLY valid JSON (no markdown, no explanation) with these fields:
+    - style: Design style (e.g., "mid-century modern", "scandinavian", "farmhouse", "industrial", "contemporary", "traditional", "bohemian", "coastal", "transitional", "rustic")
+    - primary_material: Main material (e.g., "solid wood", "engineered wood", "metal", "glass", "fabric", "leather", "ceramic", "plastic", "stone")
+    - secondary_material: Secondary material if applicable, or null
+    - color_family: Dominant color (e.g., "brown", "gray", "white", "black", "blue", "green", "beige", "multi-color")
+    - room_type: List of suitable rooms (e.g., ["living room"], ["bedroom", "guest room"])
+    - product_type: Specific category (e.g., "sofa", "dining table", "area rug", "table lamp")
+    - assembly_required: true/false/null if unknown
+    
+  user_template: |
+    Product Name: {product_name}
+    Product Description: {product_description}
+    Product Class: {product_class}
+    
+    Extract structured attributes as JSON:
+
+evaluation:
+  sample_size: 500                      # Number of products to evaluate
+  batch_size: 10                        # Concurrent API requests
+  retry_attempts: 3
+  retry_delay: 1.0                      # Seconds between retries
+
+cost_tracking:
+  enabled: true
+  log_file: "outputs/cost_log_gpt4o.jsonl"

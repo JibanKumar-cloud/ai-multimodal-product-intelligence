@@ -1,0 +1,186 @@
+{
+  "style": {
+    "unique": 232,
+    "total": 8647,
+    "top_10": [
+      [
+        "modern & contemporary",
+        2691
+      ],
+      [
+        "traditional",
+        1216
+      ],
+      [
+        "no theme",
+        813
+      ],
+      [
+        "farmhouse / country",
+        395
+      ],
+      [
+        "rustic",
+        319
+      ],
+      [
+        "coastal",
+        244
+      ],
+      [
+        "eclectic",
+        218
+      ],
+      [
+        "animal",
+        213
+      ],
+      [
+        "glam",
+        193
+      ],
+      [
+        "industrial",
+        167
+      ]
+    ]
+  },
+  "primary_material": {
+    "unique": 138,
+    "total": 5486,
+    "top_10": [
+      [
+        "polyester",
+        586
+      ],
+      [
+        "metal",
+        482
+      ],
+      [
+        "manufactured wood",
+        470
+      ],
+      [
+        "microfiber / polyester",
+        435
+      ],
+      [
+        "polypropylene",
+        276
+      ],
+      [
+        "plastic",
+        234
+      ],
+      [
+        "porcelain",
+        224
+      ],
+      [
+        "manufactured wood + solid wood",
+        217
+      ],
+      [
+        "solid wood",
+        211
+      ],
+      [
+        "100 % cotton",
+        196
+      ]
+    ]
+  },
+  "color_family": {
+    "unique": 2164,
+    "total": 9690,
+    "top_10": [
+      [
+        "black",
+        780
+      ],
+      [
+        "white",
+        771
+      ],
+      [
+        "gray",
+        576
+      ],
+      [
+        "brown",
+        552
+      ],
+      [
+        "blue",
+        333
+      ],
+      [
+        "silver",
+        193
+      ],
+      [
+        "beige",
+        173
+      ],
+      [
+        "green",
+        165
+      ],
+      [
+        "chrome",
+        150
+      ],
+      [
+        "pink",
+        106
+      ]
+    ]
+  },
+  "product_type": {
+    "unique": 32,
+    "total": 397,
+    "top_10": [
+      [
+        "floor",
+        87
+      ],
+      [
+        "tabletop",
+        64
+      ],
+      [
+        "pouf",
+        33
+      ],
+      [
+        "storage ottoman",
+        28
+      ],
+      [
+        "headboard",
+        24
+      ],
+      [
+        "serving",
+        21
+      ],
+      [
+        "standard",
+        19
+      ],
+      [
+        "poker table",
+        19
+      ],
+      [
+        "cocktail",
+        17
+      ],
+      [
+        "card table",
+        11
+      ]
+    ]
+  }
+}

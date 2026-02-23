@@ -1,0 +1,29 @@
+bi_encoder:
+  model_name: "sentence-transformers/all-MiniLM-L6-v2"
+  model_path: "outputs/checkpoints/bi-encoder"
+  embeddings_path: "outputs/search/embeddings"
+  index_path: "outputs/search/embeddings/product.index"
+  corpus_path: "data/search/product_corpus.jsonl"
+  training:
+    epochs: 5
+    batch_size: 32
+    warmup_ratio: 0.1
+cross_encoder:
+  model_name: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+  model_path: "outputs/checkpoints/cross-encoder"
+  training:
+    epochs: 3
+    batch_size: 32
+    warmup_ratio: 0.1
+retrieval_top_k: 50
+rerank_top_k: 10
+attribute_boost:
+  catalog_path: "data/enriched_catalog.jsonl"
+  alpha: 0.3
+data:
+  search_dir: "data/search"
+  bi_encoder_train: "data/search/bi_encoder_train.jsonl"
+  cross_encoder_train: "data/search/cross_encoder_train.jsonl"
+  cross_encoder_val: "data/search/cross_encoder_val.jsonl"
+  test_queries: "data/search/test_queries.jsonl"
+  product_corpus: "data/search/product_corpus.jsonl"

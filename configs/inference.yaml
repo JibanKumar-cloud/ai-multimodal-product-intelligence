@@ -1,0 +1,51 @@
+# Inference Pipeline Configuration
+
+model:
+  path: "outputs/checkpoints/qlora-llava-7b/best_model"
+  device: "auto"                        # auto, cuda, cpu
+  quantization: "4bit"
+  torch_dtype: "float16"
+
+inference:
+  batch_size: 16
+  max_new_tokens: 300
+  temperature: 0.0                      # Deterministic
+  do_sample: false
+  num_beams: 1                          # Greedy decoding for speed
+
+postprocessing:
+  parse_json: true                      # Parse model output as JSON
+  validate_schema: true                 # Validate against expected schema
+  fallback_on_parse_error: true         # Use regex fallback if JSON fails
+  normalize_values: true                # Lowercase, strip whitespace
+  
+  # Value normalization mappings
+  color_aliases:
+    "grey": "gray"
+    "beige": "beige"
+    "off-white": "white"
+    "cream": "white"
+    "tan": "brown"
+    "espresso": "brown"
+    "walnut": "brown"
+    "navy": "blue"
+    "charcoal": "gray"
+  
+  style_aliases:
+    "mid century": "mid-century modern"
+    "mid-century": "mid-century modern"
+    "scandi": "scandinavian"
+    "boho": "bohemian"
+    "country": "farmhouse"
+    "modern farmhouse": "farmhouse"
+
+caching:
+  enabled: true
+  cache_dir: "outputs/cache"
+  cache_by: "product_id"                # Cache key
+
+monitoring:
+  log_predictions: true
+  log_dir: "outputs/inference_logs"
+  track_latency: true
+  track_memory: true
