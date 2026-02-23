@@ -81,7 +81,7 @@ Not all attributes are visual. The hybrid model routes each attribute to the bes
 | color_family | VLM (image) | Visual — text often wrong |
 | style | VLM (image) | Visual cues in design |
 | primary_material | VLM → rule-based fallback | Partially visual |
-| product_type | Rule-based (text) | Only 4% training coverage |
+| product_type | VLM → rule-based fallback | Partially visual |
 | room_type | Rule-based (text) | Context from category |
 | assembly_required | Rule-based (text) | Never in images |
 
