@@ -43,7 +43,16 @@ E-commerce catalogs have messy, incomplete product data. Descriptions say "red" 
 ##  DEMO
 <img width="1440" height="900" alt="Screenshot 2026-02-22 at 10 44 41 PM" src="https://github.com/user-attachments/assets/b8b16224-3e02-45ba-9a98-542ed29fe102" />
 
-```
+## Adversarial Attribute Extraction:
+
+<img width="1440" height="900" alt="Screenshot 2026-02-23 at 1 06 43 AM" src="https://github.com/user-attachments/assets/3b598a88-adfa-4660-bfe0-0e2e9643e017" />
+
+### Product Search:
+
+<img width="1440" height="900" alt="Screenshot 2026-02-23 at 1 07 26 AM" src="https://github.com/user-attachments/assets/03d171bc-eaf3-4e11-91bd-730d18e162fa" />
+
+
+
 ## 🔑 Key Technical Contributions
 
 ### Adversarial Training to Prevent Modality Collapse
