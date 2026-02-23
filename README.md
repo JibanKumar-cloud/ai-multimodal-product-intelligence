@@ -40,7 +40,10 @@ E-commerce catalogs have messy, incomplete product data. Descriptions say "red" 
 │  Total latency: <100ms on 42K products (single T4 GPU)              │
 └─────────────────────────────────────────────────────────────────────┘
 ```
+##  DEMO
+<img width="1440" height="900" alt="Screenshot 2026-02-22 at 10 44 41 PM" src="https://github.com/user-attachments/assets/b8b16224-3e02-45ba-9a98-542ed29fe102" />
 
+```
 ## 🔑 Key Technical Contributions
 
 ### Adversarial Training to Prevent Modality Collapse
