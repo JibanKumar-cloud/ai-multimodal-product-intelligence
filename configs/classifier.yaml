@@ -1,0 +1,67 @@
+# Multi-Tower Product Classifier Configuration
+# ─────────────────────────────────────────────
+
+# Image Encoder (frozen CLIP ViT)
+image:
+  model: "openai/clip-vit-base-patch32"
+  dim: 768
+  freeze: true
+  k_max: 5                    # max images per product
+
+# Text Encoder (frozen DistilBERT)
+text:
+  model: "distilbert-base-uncased"
+  dim: 768
+  max_length: 128
+  freeze: true
+
+# Attribute Encoder (trainable MLP)
+attributes:
+  hidden_dim: 256
+  output_dim: 768
+
+# Attention Pooler (trainable)
+attention_pooler:
+  num_heads: 4
+
+# Gated Fusion (trainable)
+fusion:
+  dim: 768
+  dropout: 0.1
+
+# Hierarchical Classification
+classification:
+  hierarchy_weights: [0.1, 0.2, 0.3, 0.4]  # level1, level2, level3, leaf
+  label_smoothing: 0.1
+  focal_loss_gamma: 2.0
+  use_focal_loss: true
+
+# Mismatch Detection
+mismatch:
+  kl_threshold: 2.0
+  confidence_threshold: 0.8
+  margin_threshold: 0.1
+
+# Training
+training:
+  batch_size: 64
+  learning_rate: 1e-3
+  weight_decay: 1e-4
+  epochs: 25
+  warmup_steps: 100
+  seed: 42
+  use_precomputed: true
+
+# Paths
+paths:
+  data: "data/raw/WANDS/dataset/product.csv"
+  embeddings: "data/embeddings"
+  images: "data/images"
+  image_manifest: "data/images/manifest.json"
+  checkpoint: "outputs/checkpoints/classifier"
+  vlm_model: "outputs/checkpoints/qlora-vague-multimodal/best_model"
+
+# VLM Fallback
+vlm_fallback:
+  enabled: true
+  confidence_threshold: 0.8   # route to VLM below this

@@ -22,10 +22,30 @@ outputs/search/embeddings/
 *.index
 
 # Data (download via scripts)
-data/raw/
+# generated data/artifacts
+# Data / artifacts (do not commit)
 data/images/
+data/images/**
+
+data/images_pexels_v1/
+data/images_pexels_v1/**
+
+data/processed/
+data/processed/**
+
+data/processed_vlm_v1/
+data/processed_vlm_v1/**
+
+# common image types anywhere under data
+data/**/*.jpg
+data/**/*.jpeg
+data/**/*.png
 data/enriched_catalog.jsonl
 data/search/*.jsonl
+data/raw/
+data/raw/**
+data/*.json
+data/**/*.json
 
 # Keep processed data structure
 !data/processed/.gitkeep
