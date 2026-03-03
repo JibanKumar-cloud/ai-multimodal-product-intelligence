@@ -1,313 +1,383 @@
-"""Train Multi-Tower Product Classifier.
+"""Training script for Multi-Tower Product Classifier.
 
-Trains on precomputed embeddings (fast: ~5 min with cached, ~30 min without).
-Only trains: attention pooler + attribute MLP + gated fusion + hierarchy heads
-             + mismatch detector heads (~4.2M params)
+Architecture (all 2-way gated):
+  IMAGE -> CLIP ViT (frozen) -> attention pooler -> e_img [768]
+  TEXT  -> DistilBERT (frozen) -> e_txt [768]
+
+  TAXONOMY:      per-level gate(e_img, e_txt) -> level_1..5
+  PRODUCT_CLASS: gate(e_img, e_txt) -> ~580 classes
+  ATTRIBUTES:    per-attr gate(e_img, e_txt)  -> 7 predictions
+
+  Low confidence at inference -> VLM fallback
 
 Usage:
-    # Step 1: precompute embeddings (run once)
-    python scripts/precompute_embeddings.py --text-only
-
-    # Step 2: train classifier
-    python scripts/train_classifier.py
-
-    # With custom settings
-    python scripts/train_classifier.py --epochs 30 --lr 1e-3 --batch-size 64
+    PYTHONPATH=. python scripts/train_classifier.py \
+      --queue data/processed/image_queue.json \
+      --images data/images/wayfair \
+      --vocab data/processed/attribute_vocab.json \
+      --taxonomy data/processed/taxonomy_tree.json \
+      --tsv data/processed/classifier_products.tsv \
+      --epochs 20 --batch-size 32
 """
-import os
-import sys
-import json
 import argparse
-from pathlib import Path
-from datetime import datetime
+import json
+import os
+import time
 
-import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from loguru import logger
-from tqdm import tqdm
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from src.classifier.config import ClassifierConfig
-from src.classifier.model import MultiTowerClassifier
-from src.classifier.dataset import (
-    ClassifierDataset, build_taxonomy, create_splits, collate_fn
-)
-
-import pandas as pd
+from src.classifier.dataset import build_dataloaders
+from src.classifier.attribute_head import AttributePredictor
+from src.classifier.taxonomy_head import TaxonomyPredictor
 
 
-def train_epoch(model, dataloader, optimizer, device, epoch):
-    """Train for one epoch."""
+# ════════════════════════════════════════════════════════════════
+# Encoders
+# ════════════════════════════════════════════════════════════════
+
+class TextEncoder(nn.Module):
+    """Frozen DistilBERT -> CLS embedding."""
+
+    def __init__(self, model_name="distilbert-base-uncased"):
+        super().__init__()
+        from transformers import DistilBertModel, DistilBertTokenizer
+        self.tokenizer = DistilBertTokenizer.from_pretrained(model_name)
+        self.model = DistilBertModel.from_pretrained(model_name)
+        for p in self.model.parameters():
+            p.requires_grad = False
+
+    @torch.no_grad()
+    def forward(self, texts):
+        # Handle empty strings gracefully
+        texts = [t if t else "[PAD]" for t in texts]
+        tokens = self.tokenizer(
+            texts, padding=True, truncation=True,
+            max_length=256, return_tensors="pt")
+        tokens = {k: v.to(self.model.device) for k, v in tokens.items()}
+        return self.model(**tokens).last_hidden_state[:, 0, :]
+
+
+class ImageEncoder(nn.Module):
+    """Frozen CLIP ViT + trainable attention pooler."""
+
+    def __init__(self, model_name="openai/clip-vit-base-patch32",
+                 output_dim=768):
+        super().__init__()
+        from transformers import CLIPVisionModel
+        self.model = CLIPVisionModel.from_pretrained(model_name)
+        for p in self.model.parameters():
+            p.requires_grad = False
+
+        clip_dim = self.model.config.hidden_size
+        self.output_dim = output_dim
+        self.attn_pool = nn.MultiheadAttention(
+            embed_dim=clip_dim, num_heads=8, batch_first=True)
+        self.query = nn.Parameter(torch.randn(1, 1, clip_dim) * 0.02)
+        self.proj = (nn.Linear(clip_dim, output_dim)
+                     if clip_dim != output_dim else nn.Identity())
+
+    def forward(self, images, image_mask):
+        B, N, C, H, W = images.shape
+        device = images.device
+
+        # Per-sample check: which samples have NO images at all
+        has_any_image = image_mask.any(dim=-1)  # [B]
+
+        if not has_any_image.any():
+            return torch.zeros(B, self.output_dim, device=device)
+
+        with torch.no_grad():
+            features = self.model(
+                pixel_values=images.view(B * N, C, H, W)).pooler_output
+        features = features.view(B, N, -1)
+
+        # For samples with no images: use mean pooling (safe, no attention)
+        # For samples with images: use attention pooling
+        result = torch.zeros(B, self.output_dim, device=device)
+
+        # Process samples WITH images through attention
+        valid_idx = has_any_image.nonzero(as_tuple=True)[0]
+        if len(valid_idx) > 0:
+            valid_features = features[valid_idx]           # [V, N, D]
+            valid_mask = ~image_mask[valid_idx]            # [V, N] (key_padding)
+            query = self.query.expand(len(valid_idx), -1, -1)
+            pooled, _ = self.attn_pool(
+                query, valid_features, valid_features,
+                key_padding_mask=valid_mask)
+            pooled = pooled.squeeze(1)                     # [V, D]
+            result[valid_idx] = self.proj(pooled)
+
+        return result
+
+
+# ════════════════════════════════════════════════════════════════
+# Full Model
+# ════════════════════════════════════════════════════════════════
+
+class ProductClassifier(nn.Module):
+    """
+    e_img + e_txt -> taxonomy + product_class + 7 attributes
+    All 2-way gated. Handles missing modalities.
+    """
+
+    def __init__(self, taxonomy_path, vocab_path=None, input_dim=768):
+        super().__init__()
+        self.text_encoder = TextEncoder()
+        self.image_encoder = ImageEncoder(output_dim=input_dim)
+        self.taxonomy_heads = TaxonomyPredictor(
+            input_dim=input_dim, taxonomy_path=taxonomy_path)
+        self.attribute_heads = AttributePredictor(
+            input_dim=input_dim, vocab_path=vocab_path)
+
+    def forward(self, batch):
+        device = next(self.parameters()).device
+        e_txt = self.text_encoder(batch["text_input"])
+        e_img = self.image_encoder(
+            batch["images"].to(device),
+            batch["image_mask"].to(device))
+
+        tax_out = self.taxonomy_heads(e_img, e_txt)
+        attr_out = self.attribute_heads(e_img, e_txt)
+
+        return {
+            "taxonomy": tax_out,
+            "attributes": attr_out,
+            "e_img": e_img, "e_txt": e_txt,
+        }
+
+
+# ════════════════════════════════════════════════════════════════
+# Training
+# ════════════════════════════════════════════════════════════════
+
+def train_one_epoch(model, loader, optimizer, device, epoch):
     model.train()
-    total_loss = 0
-    total_main = 0
-    total_mismatch = 0
-    n_batches = 0
-    correct = {}
-    total = {}
+    sums = {"total": 0, "tax": 0, "attr": 0}
+    n = 0
 
-    pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
-    for batch in pbar:
-        # Move to device
-        img_emb = batch["image_embeddings"].to(device)
-        img_mask = batch["image_mask"].to(device)
-        txt_emb = batch["text_embeddings"].to(device)
-        attr_idx = batch["attr_indices"].to(device)
-        labels = {k: v.to(device) for k, v in batch["labels"].items()
-                  if not isinstance(v, dict)}
-        # Attribute labels nested dict
-        if "attributes" in batch["labels"]:
-            labels["attributes"] = {
-                k: v.to(device) for k, v in batch["labels"]["attributes"].items()
-            }
-
-        # Forward
-        output = model(img_emb, img_mask, txt_emb, attr_idx, labels=labels)
-
-        loss = output["loss"]
-
-        # Backward
+    for i, batch in enumerate(loader):
         optimizer.zero_grad()
+        out = model(batch)
+
+        # Taxonomy + product_class loss
+        tax_labels = {k: batch[k].to(device)
+                      for k in batch if k.startswith("tax_")}
+        tax_labels["product_class"] = batch["product_class"].to(device)
+        tax_loss, tax_det = model.taxonomy_heads.compute_loss(
+            out["taxonomy"], tax_labels)
+
+        # Attribute loss
+        attr_labels = {k.replace("attr_", ""): batch[k].to(device)
+                       for k in batch if k.startswith("attr_")}
+        attr_loss, attr_det = model.attribute_heads.compute_loss(
+            out["attributes"], attr_labels)
+
+        loss = tax_loss + attr_loss
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
-        # Track metrics
-        total_loss += loss.item()
-        total_main += output.get("main_loss", torch.tensor(0)).item()
-        total_mismatch += output.get("mismatch_loss", torch.tensor(0)).item()
-        n_batches += 1
+        sums["total"] += loss.item()
+        sums["tax"] += tax_loss.item()
+        sums["attr"] += attr_loss.item()
+        n += 1
 
-        # Accuracy tracking (dynamic levels)
-        with torch.no_grad():
-            for level in output["logits"]:
-                if level in labels:
-                    logits = output["logits"][level]
-                    lbl = labels[level]
-                    valid_mask = lbl >= 0
-                    if valid_mask.any():
-                        pred = logits[valid_mask].argmax(dim=-1)
-                        if level not in correct:
-                            correct[level] = 0
-                            total[level] = 0
-                        correct[level] += (pred == lbl[valid_mask]).sum().item()
-                        total[level] += valid_mask.sum().item()
+        if i % 50 == 0:
+            print(f"  [{epoch}][{i}/{len(loader)}] "
+                  f"loss={loss.item():.4f} "
+                  f"tax={tax_loss.item():.4f} "
+                  f"attr={attr_loss.item():.4f}")
+            if attr_det:
+                print(f"    attr: {' '.join(f'{k}={v:.3f}' for k, v in attr_det.items())}")
+            if tax_det:
+                print(f"    tax:  {' '.join(f'{k}={v:.3f}' for k, v in tax_det.items())}")
 
-        # Update progress bar
-        leaf_acc = correct.get("leaf", 0) / max(total.get("leaf", 1), 1) * 100
-        pbar.set_postfix({
-            "loss": f"{loss.item():.4f}",
-            "leaf_acc": f"{leaf_acc:.1f}%",
-        })
-
-    avg_loss = total_loss / max(n_batches, 1)
-    accs = {k: correct[k] / max(total[k], 1) * 100 for k in correct}
-
-    return avg_loss, accs
+    return {k: v / max(n, 1) for k, v in sums.items()}
 
 
 @torch.no_grad()
-def evaluate(model, dataloader, device):
-    """Evaluate on validation set."""
+def evaluate(model, loader, device):
     model.eval()
-    total_loss = 0
-    n_batches = 0
-    correct = {}
-    total = {}
-    mismatch_count = 0
-    total_products = 0
+    sums = {"total": 0, "tax": 0, "attr": 0}
+    n = 0
+    correct, total_count = {}, {}
 
-    for batch in dataloader:
-        img_emb = batch["image_embeddings"].to(device)
-        img_mask = batch["image_mask"].to(device)
-        txt_emb = batch["text_embeddings"].to(device)
-        attr_idx = batch["attr_indices"].to(device)
-        labels = {k: v.to(device) for k, v in batch["labels"].items()
-                  if not isinstance(v, dict)}
-        if "attributes" in batch["labels"]:
-            labels["attributes"] = {
-                k: v.to(device) for k, v in batch["labels"]["attributes"].items()
-            }
+    for batch in loader:
+        out = model(batch)
 
-        output = model(img_emb, img_mask, txt_emb, attr_idx, labels=labels)
+        tax_labels = {k: batch[k].to(device)
+                      for k in batch if k.startswith("tax_")}
+        tax_labels["product_class"] = batch["product_class"].to(device)
+        tax_loss, _ = model.taxonomy_heads.compute_loss(
+            out["taxonomy"], tax_labels)
 
-        total_loss += output["loss"].item()
-        n_batches += 1
+        attr_labels = {k.replace("attr_", ""): batch[k].to(device)
+                       for k in batch if k.startswith("attr_")}
+        attr_loss, _ = model.attribute_heads.compute_loss(
+            out["attributes"], attr_labels)
 
-        for level in output["logits"]:
-            if level in labels:
-                logits = output["logits"][level]
-                lbl = labels[level]
-                valid_mask = lbl >= 0
-                if valid_mask.any():
-                    pred = logits[valid_mask].argmax(dim=-1)
-                    if level not in correct:
-                        correct[level] = 0
-                        total[level] = 0
-                    correct[level] += (pred == lbl[valid_mask]).sum().item()
-                    total[level] += valid_mask.sum().item()
+        sums["total"] += (tax_loss + attr_loss).item()
+        sums["tax"] += tax_loss.item()
+        sums["attr"] += attr_loss.item()
+        n += 1
 
-        # Check mismatch detection
-        result = model.predict(img_emb, img_mask, txt_emb, attr_idx)
-        for mr in result["mismatch_results"]:
-            total_products += 1
-            if mr.mismatch_detected:
-                mismatch_count += 1
+        # Attribute accuracy
+        for name, head_out in out["attributes"].items():
+            if name not in attr_labels:
+                continue
+            lbl = attr_labels[name]
+            valid = lbl >= 0
+            if not valid.any():
+                continue
+            preds = head_out["logits"][valid].argmax(-1)
+            correct[name] = correct.get(name, 0) + (preds == lbl[valid]).sum().item()
+            total_count[name] = total_count.get(name, 0) + valid.sum().item()
 
-    avg_loss = total_loss / max(n_batches, 1)
-    accs = {k: correct[k] / max(total[k], 1) * 100 for k in correct}
-    mismatch_rate = mismatch_count / max(total_products, 1) * 100
+        # Taxonomy accuracy
+        for name, head_out in out["taxonomy"].items():
+            lk = f"tax_{name}" if name != "product_class" else "product_class"
+            if lk not in tax_labels and lk not in batch:
+                continue
+            lbl = tax_labels.get(lk, batch.get(lk, torch.tensor([])).to(device))
+            if lbl.numel() == 0:
+                continue
+            valid = lbl >= 0
+            if not valid.any():
+                continue
+            preds = head_out["logits"][valid].argmax(-1)
+            key = f"tax_{name}" if name != "product_class" else name
+            correct[key] = correct.get(key, 0) + (preds == lbl[valid]).sum().item()
+            total_count[key] = total_count.get(key, 0) + valid.sum().item()
 
-    return avg_loss, accs, mismatch_rate
+    acc = {k: correct[k] / total_count[k]
+           for k in correct if total_count.get(k, 0) > 0}
+
+    return {
+        "losses": {k: v / max(n, 1) for k, v in sums.items()},
+        "accuracy": acc,
+    }
+
+
+def print_gates(model, loader, device):
+    model.eval()
+    batch = next(iter(loader))
+    out = model(batch)
+
+    print(f"\n  Attribute gates (w_img / w_txt):")
+    ag = model.attribute_heads.get_gate_summary(out["e_img"], out["e_txt"])
+    for name, w in ag.items():
+        bi = "#" * int(w["w_img"] * 20)
+        bt = "#" * int(w["w_txt"] * 20)
+        print(f"    {name:25s} img={w['w_img']:.3f} [{bi:20s}] "
+              f"txt={w['w_txt']:.3f} [{bt:20s}]")
+
+    print(f"\n  Taxonomy gates (w_img / w_txt):")
+    tg = model.taxonomy_heads.get_gate_summary(out["e_img"], out["e_txt"])
+    for name, w in tg.items():
+        bi = "#" * int(w["w_img"] * 20)
+        bt = "#" * int(w["w_txt"] * 20)
+        print(f"    {name:25s} img={w['w_img']:.3f} [{bi:20s}] "
+              f"txt={w['w_txt']:.3f} [{bt:20s}]")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train classifier")
-    parser.add_argument("--data-path",
-                        default="data/raw/WANDS/dataset/product.csv")
-    parser.add_argument("--embeddings-dir", default="data/embeddings")
-    parser.add_argument("--checkpoint-dir",
-                        default="outputs/checkpoints/classifier")
-    parser.add_argument("--epochs", type=int, default=25)
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--k-max", type=int, default=5)
-    parser.add_argument("--device", default="auto")
-    parser.add_argument("--seed", type=int, default=42)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--queue", required=True)
+    parser.add_argument("--images", required=True)
+    parser.add_argument("--vocab", required=True)
+    parser.add_argument("--taxonomy", required=True)
+    parser.add_argument("--tsv", default=None)
+    parser.add_argument("--output", default="checkpoints")
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--val-split", type=float, default=0.1)
+    parser.add_argument("--num-workers", type=int, default=4)
     args = parser.parse_args()
 
-    # Set device
-    if args.device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    else:
-        device = args.device
-    logger.info(f"Device: {device}")
+    os.makedirs(args.output, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
 
-    # Set seed
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-
-    # Load data
-    logger.info(f"Loading products from {args.data_path}")
-    df = pd.read_csv(args.data_path, sep="\t")
-    logger.info(f"Loaded {len(df)} products")
-
-    # Build taxonomy
-    taxonomy_path = os.path.join(args.embeddings_dir, "taxonomy.json")
-    if os.path.exists(taxonomy_path):
-        with open(taxonomy_path) as f:
-            taxonomy = json.load(f)
-        logger.info(f"Loaded taxonomy from {taxonomy_path}")
-    else:
-        taxonomy = build_taxonomy(df)
-
-    # Create splits
-    train_df, val_df, test_df = create_splits(df)
-
-    # Create datasets
-    train_ds = ClassifierDataset(
-        train_df, taxonomy, args.embeddings_dir,
-        k_max=args.k_max, mode="cached", split="train")
-    val_ds = ClassifierDataset(
-        val_df, taxonomy, args.embeddings_dir,
-        k_max=args.k_max, mode="cached", split="val")
-
-    train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
-        collate_fn=collate_fn, num_workers=2, pin_memory=True)
-    val_loader = DataLoader(
-        val_ds, batch_size=args.batch_size, shuffle=False,
-        collate_fn=collate_fn, num_workers=2, pin_memory=True)
-
-    # Create model
-    config = ClassifierConfig(
-        k_max=args.k_max,
+    train_loader, val_loader = build_dataloaders(
+        queue_path=args.queue,
+        image_dir=args.images,
+        vocab_path=args.vocab,
+        taxonomy_path=args.taxonomy,
+        tsv_path=args.tsv,
         batch_size=args.batch_size,
-        learning_rate=args.lr,
-        epochs=args.epochs,
-        embeddings_dir=args.embeddings_dir,
-        checkpoint_dir=args.checkpoint_dir,
+        val_split=args.val_split,
+        num_workers=args.num_workers,
     )
-    model = MultiTowerClassifier(config, taxonomy).to(device)
 
-    # Optimizer (only trainable params)
+    model = ProductClassifier(
+        taxonomy_path=args.taxonomy,
+        vocab_path=args.vocab,
+    ).to(device)
+
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    print(f"Parameters: {trainable:,} trainable / {total:,} total")
+
     optimizer = AdamW(
         [p for p in model.parameters() if p.requires_grad],
-        lr=args.lr,
-        weight_decay=config.weight_decay,
-    )
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
+        lr=args.lr, weight_decay=0.01)
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
 
-    # Training loop
-    best_val_acc = 0
-    best_epoch = 0
-    history = []
-
-    logger.info(f"\n{'='*60}")
-    logger.info(f"TRAINING MULTI-TOWER CLASSIFIER")
-    logger.info(f"{'='*60}")
-    logger.info(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
-    logger.info(f"Epochs: {args.epochs}, Batch: {args.batch_size}, LR: {args.lr}")
-    taxonomy_summary = ", ".join(
-        f"{k}={len(v)}" for k, v in taxonomy.items())
-    logger.info(f"Taxonomy: {taxonomy_summary}")
-
+    best_val = float("inf")
     for epoch in range(1, args.epochs + 1):
-        # Train
-        train_loss, train_accs = train_epoch(
-            model, train_loader, optimizer, device, epoch)
-
-        # Evaluate
-        val_loss, val_accs, mismatch_rate = evaluate(
-            model, val_loader, device)
-
+        t0 = time.time()
+        tm = train_one_epoch(model, train_loader, optimizer, device, epoch)
+        vm = evaluate(model, val_loader, device)
         scheduler.step()
 
-        # Log
-        logger.info(
-            f"Epoch {epoch}/{args.epochs} | "
-            f"Train loss: {train_loss:.4f} | Val loss: {val_loss:.4f} | "
-            f"Train leaf: {train_accs['leaf']:.1f}% | "
-            f"Val leaf: {val_accs['leaf']:.1f}% | "
-            f"Mismatch: {mismatch_rate:.1f}%"
-        )
+        vl = vm["losses"]
+        print(f"\nEpoch {epoch}/{args.epochs} "
+              f"({time.time()-t0:.1f}s, lr={optimizer.param_groups[0]['lr']:.6f})")
+        print(f"  Train: loss={tm['total']:.4f} "
+              f"(tax={tm['tax']:.4f} attr={tm['attr']:.4f})")
+        print(f"  Val:   loss={vl['total']:.4f} "
+              f"(tax={vl['tax']:.4f} attr={vl['attr']:.4f})")
 
-        epoch_result = {
-            "epoch": epoch,
-            "train_loss": train_loss,
-            "val_loss": val_loss,
-            "train_accs": train_accs,
-            "val_accs": val_accs,
-            "mismatch_rate": mismatch_rate,
-            "lr": optimizer.param_groups[0]["lr"],
-        }
-        history.append(epoch_result)
+        # Print accuracies grouped
+        acc = vm["accuracy"]
+        tax_acc = {k: v for k, v in acc.items()
+                   if k.startswith("tax_") or k == "product_class"}
+        attr_acc = {k: v for k, v in acc.items()
+                    if k not in tax_acc}
 
-        # Save best model
-        if val_accs["leaf"] > best_val_acc:
-            best_val_acc = val_accs["leaf"]
-            best_epoch = epoch
-            model.save(args.checkpoint_dir)
-            logger.info(f"  ★ New best: {best_val_acc:.1f}% leaf accuracy")
+        if tax_acc:
+            print(f"  Taxonomy accuracy:")
+            for k, v in sorted(tax_acc.items()):
+                print(f"    {k:25s}: {v:.3f}")
+        if attr_acc:
+            print(f"  Attribute accuracy:")
+            for k, v in sorted(attr_acc.items()):
+                print(f"    {k:25s}: {v:.3f}")
 
-    # Save training history
-    history_path = os.path.join(args.checkpoint_dir, "training_history.json")
-    with open(history_path, "w") as f:
-        json.dump(history, f, indent=2)
+        if epoch % 5 == 0:
+            print_gates(model, val_loader, device)
 
-    logger.info(f"\n{'='*60}")
-    logger.info(f"TRAINING COMPLETE")
-    logger.info(f"{'='*60}")
-    logger.info(f"Best epoch: {best_epoch}")
-    logger.info(f"Best val leaf accuracy: {best_val_acc:.1f}%")
-    logger.info(f"Model saved: {args.checkpoint_dir}")
-    logger.info(f"History: {history_path}")
-    logger.info(f"\nNext: python scripts/evaluate_classifier.py")
+        if vl["total"] < best_val:
+            best_val = vl["total"]
+            torch.save({
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "val_loss": vl["total"],
+                "accuracy": vm["accuracy"],
+            }, os.path.join(args.output, "best_model.pt"))
+            print(f"  -> Saved best (val_loss={best_val:.4f})")
+
+    torch.save({
+        "epoch": args.epochs,
+        "model_state_dict": model.state_dict(),
+    }, os.path.join(args.output, "final_model.pt"))
+    print(f"\nDone. Best val_loss: {best_val:.4f}")
 
 
 if __name__ == "__main__":
