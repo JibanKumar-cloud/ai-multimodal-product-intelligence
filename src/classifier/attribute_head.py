@@ -1,59 +1,57 @@
-"""Attribute Prediction with Per-Attribute 2-Way Gating.
+"""Attribute Prediction with Modality-Specific Head Types.
 
-7 heads, each with [e_img, e_txt] -> own gate -> prediction.
+Each attribute uses the head type that matches its information source:
 
-Handles all modality combinations:
-  image + text  → gate balances both
-  image only    → gate shifts to w_img≈1.0
-  text only     → gate shifts to w_txt≈1.0
+  COLOR (primary/secondary):
+    ConcatHead — concatenates e_img + e_txt, no gate.
+    Both modalities always contribute. Text says "espresso",
+    image confirms dark brown tone. They complement, not compete.
 
-Expected gate convergence after training:
-  primary_color:      w_img=0.85  w_txt=0.15  (visual)
-  secondary_color:    w_img=0.80  w_txt=0.20  (visual)
-  shape:              w_img=0.90  w_txt=0.10  (visual)
-  primary_material:   w_img=0.65  w_txt=0.35  (texture + text)
-  secondary_material: w_img=0.60  w_txt=0.40  (texture + text)
-  style:              w_img=0.45  w_txt=0.55  (both)
-  assembly:           w_img=0.05  w_txt=0.95  (pure text)
+  SHAPE:
+    Image-only — fed (e_img, zeros). Shape is purely visual.
+
+  ASSEMBLY:
+    Text-only — fed (zeros, e_txt). Can't see "needs screwdriver" in a photo.
+
+  MATERIAL, STYLE:
+    GatedHead — learned gate balances image vs text.
 """
 import json
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from collections import OrderedDict
 
 from .gated_head import GatedHead
 
 
-DEFAULT_VOCAB = {
-    "primary_color": [
-        "beige", "black", "blue", "brown", "clear", "gold_metal",
-        "gray", "green", "multi", "orange", "other", "pink",
-        "purple", "red", "silver", "white", "yellow",
-    ],
-    "secondary_color": [
-        "beige", "black", "blue", "brown", "clear", "gold_metal",
-        "gray", "green", "multi", "orange", "pink", "purple",
-        "red", "silver", "white", "yellow",
-    ],
-    "primary_material": [
-        "ceramic", "fabric", "foam", "glass", "leather", "metal",
-        "natural_fiber", "other", "plastic", "stone", "synthetics", "wood",
-    ],
-    "secondary_material": [
-        "ceramic", "fabric", "foam", "glass", "leather", "metal",
-        "mixed", "natural_fiber", "plastic", "stone", "synthetics", "wood",
-    ],
-    "style": [
-        "bohemian", "coastal", "farmhouse", "glam", "industrial",
-        "mid-century modern", "modern", "other", "rustic",
-        "scandinavian", "traditional", "transitional",
-    ],
-    "shape": [
-        "hexagon", "irregular", "l-shaped", "other", "oval",
-        "rectangular", "round", "runner", "square", "u-shaped",
-    ],
-    "assembly": ["full", "none", "partial"],
-}
+class ConcatHead(nn.Module):
+    """Classification head that concatenates both modalities (no gate).
+
+    Input: concat(e_img, e_txt) → [B, 2*D]
+    Always uses both — no modality competition.
+    Better for attributes where text names the value and image confirms it.
+    """
+
+    def __init__(self, input_dim: int, num_classes: int):
+        super().__init__()
+        concat_dim = input_dim * 2  # 1536
+        self.classifier = nn.Sequential(
+            nn.Linear(concat_dim, concat_dim // 4),  # 1536 → 384
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(concat_dim // 4, num_classes),
+        )
+
+    def forward(self, e_img, e_txt):
+        z = torch.cat([e_img, e_txt], dim=-1)
+        logits = self.classifier(z)
+        # Return compatible format with GatedHead
+        B = e_img.shape[0]
+        fake_gate = torch.tensor([[0.5, 0.5]],
+                                 device=e_img.device).expand(B, -1)
+        return {"logits": logits, "gate_weights": fake_gate}
+
 
 LOSS_WEIGHTS = {
     "primary_color": 1.5,
@@ -65,9 +63,28 @@ LOSS_WEIGHTS = {
     "assembly": 0.3,
 }
 
+# Which head type for each attribute
+HEAD_TYPES = {
+    "primary_color": "concat",      # text says "espresso", image shows dark tone
+    "secondary_color": "concat",    # text + image
+    "primary_material": "concat",   # text says "oak", image shows wood grain
+    "secondary_material": "concat", # text says "wood frame", image shows texture
+    "style": "concat",              # text says "farmhouse", image shows aesthetic
+    "shape": "image_only",          # pure image — round, rectangular, L-shaped
+    "assembly": "concat",           # image shows complexity, text has product type
+}
 
-class AttributePredictor(torch.nn.Module):
-    """7 attribute heads with per-attribute 2-way gating."""
+
+class AttributePredictor(nn.Module):
+    """7 attribute heads with modality-specific architectures.
+
+    Colors: ConcatHead (both modalities always used)
+    Shape: image-only (GatedHead fed zeros for text)
+    Assembly: text-only (GatedHead fed zeros for image)
+    Material, Style: GatedHead (learned balance)
+    """
+
+    ATTR_KEYS = list(HEAD_TYPES.keys())
 
     def __init__(self, input_dim: int = 768, vocab_path: str = None):
         super().__init__()
@@ -76,20 +93,32 @@ class AttributePredictor(torch.nn.Module):
             with open(vocab_path) as f:
                 vocab = json.load(f)
         else:
-            vocab = DEFAULT_VOCAB
+            vocab = {}
 
         self.attributes = OrderedDict()
-        self.heads = torch.nn.ModuleDict()
+        self.heads = nn.ModuleDict()
+        self.head_types = {}
         self.value_to_idx = {}
         self.idx_to_value = {}
 
-        for attr_name, values in vocab.items():
+        for attr_name in self.ATTR_KEYS:
+            values = vocab.get(attr_name, [])
             num_classes = len(values) + 1  # +1 for UNK
+
             self.attributes[attr_name] = {
                 "values": values,
                 "loss_weight": LOSS_WEIGHTS.get(attr_name, 1.0),
             }
-            self.heads[attr_name] = GatedHead(input_dim, num_classes)
+
+            head_type = HEAD_TYPES[attr_name]
+            self.head_types[attr_name] = head_type
+
+            if head_type == "concat":
+                self.heads[attr_name] = ConcatHead(input_dim, num_classes)
+            else:
+                # gated, image_only, text_only all use GatedHead
+                # (modality zeroing happens in forward)
+                self.heads[attr_name] = GatedHead(input_dim, num_classes)
 
             v2i = {"<UNK>": 0}
             i2v = {0: "<UNK>"}
@@ -100,8 +129,75 @@ class AttributePredictor(torch.nn.Module):
             self.idx_to_value[attr_name] = i2v
 
     def forward(self, e_img, e_txt):
-        return {name: head(e_img, e_txt)
-                for name, head in self.heads.items()}
+        results = {}
+        for name, head in self.heads.items():
+            head_type = self.head_types[name]
+
+            if head_type == "concat":
+                # Color: always uses both modalities (ConcatHead)
+                results[name] = head(e_img, e_txt)
+
+            elif head_type == "text_only":
+                # Assembly: zero out image → gate forced to use text
+                results[name] = head(torch.zeros_like(e_img), e_txt)
+
+            elif head_type == "image_only":
+                # Shape: zero out text → gate forced to use image
+                results[name] = head(e_img, torch.zeros_like(e_txt))
+
+            else:
+                # Material, Style: learned gate
+                results[name] = head(e_img, e_txt)
+
+        return results
+
+    def compute_class_weights(self, products, smoothing=0.1):
+        """Compute inverse-frequency class weights from training data.
+
+        Call once after creating model:
+            model.attribute_heads.compute_class_weights(queue_products)
+
+        Uses sqrt(inverse frequency) to avoid over-weighting extreme rarities.
+        """
+        import torch
+        from collections import Counter
+
+        self.class_weights = {}
+
+        for attr_name, v2i in self.value_to_idx.items():
+            num_classes = len(v2i)  # includes <UNK>
+
+            # Count per-class frequency
+            counts = Counter()
+            for p in products:
+                val = p.get(attr_name)
+                if val and val in v2i:
+                    counts[v2i[val]] += 1
+                elif val:
+                    counts[0] += 1  # <UNK>
+
+            total = sum(counts.values())
+            if total == 0:
+                continue
+
+            # Inverse frequency with sqrt smoothing
+            # weight_i = sqrt(total / (num_classes * count_i))
+            weights = torch.ones(num_classes)
+            for cls_idx in range(num_classes):
+                c = counts.get(cls_idx, 0)
+                if c > 0:
+                    weights[cls_idx] = (total / (num_classes * c)) ** 0.5
+                else:
+                    weights[cls_idx] = 1.0  # default for unseen
+
+            # Normalize so mean weight = 1.0
+            weights = weights / weights.mean()
+            self.class_weights[attr_name] = weights
+
+        print(f"  Class weights computed for {len(self.class_weights)} attributes")
+        for attr_name, w in self.class_weights.items():
+            print(f"    {attr_name:25s}: min={w.min():.2f}, max={w.max():.2f}, "
+                  f"range={w.max()/w.min():.1f}x")
 
     def compute_loss(self, logits_dict, labels_dict):
         device = next(iter(logits_dict.values()))["logits"].device
@@ -116,11 +212,18 @@ class AttributePredictor(torch.nn.Module):
             if not valid.any():
                 continue
 
-            weight = self.attributes[attr_name]["loss_weight"]
+            attr_weight = self.attributes[attr_name]["loss_weight"]
+
+            # Per-class weights (inverse frequency)
+            cls_weight = None
+            if hasattr(self, 'class_weights') and attr_name in self.class_weights:
+                cls_weight = self.class_weights[attr_name].to(device)
+
             loss = F.cross_entropy(
                 head_out["logits"][valid], labels[valid],
+                weight=cls_weight,
                 reduction="mean", label_smoothing=0.1)
-            total_loss = total_loss + weight * loss
+            total_loss = total_loss + attr_weight * loss
             per_attr[attr_name] = loss.item()
 
         return total_loss, per_attr
@@ -144,13 +247,19 @@ class AttributePredictor(torch.nn.Module):
                     "confidence": c,
                     "needs_vlm": c < confidence_threshold,
                     "gate_weights": gw[i].tolist(),
+                    "head_type": self.head_types[attr_name],
                 }
         return results
 
     def get_gate_summary(self, e_img, e_txt):
         logits_dict = self.forward(e_img, e_txt)
-        return {
-            name: {"w_img": out["gate_weights"].mean(0)[0].item(),
-                   "w_txt": out["gate_weights"].mean(0)[1].item()}
-            for name, out in logits_dict.items()
-        }
+        summary = {}
+        for name, out in logits_dict.items():
+            ht = self.head_types[name]
+            gw = out["gate_weights"].mean(0)
+            summary[name] = {
+                "w_img": gw[0].item(),
+                "w_txt": gw[1].item(),
+                "type": ht,
+            }
+        return summary

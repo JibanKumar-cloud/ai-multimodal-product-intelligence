@@ -1,106 +1,96 @@
-"""Taxonomy + Product Class Prediction with 2-Way Gating.
+"""Cascading Taxonomy + Conditioned Product Class Prediction.
 
-Predicts:
-  level_1: "Furniture"              (54 classes)
-  level_2: "Living Room Furniture"  (126 classes)
-  level_3: "Cabinets & Chests"     (440 classes)
-  level_4: "Brown Cabinets"         (785 classes)
-  level_5+: deeper levels           (variable)
-  product_class: "Accent Chests / Cabinets"  (~580 classes)
+Architecture:
+  level_1: gate(e_img, e_txt) → "Furniture"
+  level_2: gate(e_img, e_txt) + level_1_probs → "Living Room"     (narrows ~20)
+  level_3: gate(e_img, e_txt) + level_1+2_probs → "Sofas"         (narrows ~50)
+  level_4: gate(e_img, e_txt) + level_1+2+3_probs → "Sectionals"
+  ...
+  product_class: gate(e_img, e_txt) + all_level_probs → "Sectional Sofas"
 
-Taxonomy levels are independent 2-way gated heads.
-Product class is CONDITIONED on taxonomy — it receives the probability
-distributions from all taxonomy heads as additional context, so it knows
-where in the taxonomy tree the product sits before predicting class.
+Each deeper level receives accumulated probability context from all
+previous levels, so it knows WHERE in the taxonomy tree to look.
 
-Gradient flows back: product_class loss → taxonomy probs → taxonomy heads.
-This creates mutual reinforcement between taxonomy and product_class.
+Gradients flow back through all softmax probs — deeper level losses
+improve shallower predictions through backprop.
 """
 import json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from collections import OrderedDict
 
 from .gated_head import GatedHead
 
 
-class TaxonomyConditionedClassHead(nn.Module):
-    """Product class head conditioned on taxonomy distributions.
+class CascadingHead(nn.Module):
+    """Taxonomy head conditioned on parent level distributions.
 
-    Takes the standard gated fusion z = w_img * e_img + w_txt * e_txt
-    PLUS a projected taxonomy context vector built from the probability
-    distributions of all taxonomy level heads.
+    Uses concatenation (not gating) for e_img + e_txt — same fix as attributes.
+    CLIP is too dominant for learned gating.
 
-    Architecture:
-        tax_probs (all levels) → concat → project → tax_emb [256]
-        gate(e_img, e_txt) → z [768]
-        concat(z, tax_emb) [1024] → MLP → product_class logits
+    level_1: concat(e_img, e_txt) → classify
+    level_2+: concat(e_img, e_txt, parent_probs_proj) → classify
     """
 
     def __init__(self, input_dim: int, num_classes: int,
-                 tax_probs_dim: int, tax_proj_dim: int = 256):
+                 parent_probs_dim: int = 0, proj_dim: int = 128):
         super().__init__()
+        self.has_parent = parent_probs_dim > 0
 
-        # Gate: same 2-way gate as other heads
-        self.gate = nn.Sequential(
-            nn.Linear(input_dim * 2, 128),
-            nn.ReLU(),
-            nn.Linear(128, 2),
-        )
+        # Concat both modalities (no gate)
+        base_dim = input_dim * 2  # 1536
 
-        # Taxonomy context projector
-        # tax_probs_dim = sum of all taxonomy level class counts
-        self.tax_projector = nn.Sequential(
-            nn.Linear(tax_probs_dim, tax_proj_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-        )
+        if self.has_parent:
+            self.parent_projector = nn.Sequential(
+                nn.Linear(parent_probs_dim, proj_dim),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+            )
+            classifier_input_dim = base_dim + proj_dim  # 1536 + 128
+        else:
+            classifier_input_dim = base_dim  # 1536
 
-        # Classifier takes fused embedding + taxonomy context
-        fused_dim = input_dim + tax_proj_dim  # 768 + 256 = 1024
         self.classifier = nn.Sequential(
-            nn.Linear(fused_dim, fused_dim // 2),  # 1024 → 512
+            nn.Linear(classifier_input_dim, classifier_input_dim // 4),
             nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(fused_dim // 2, num_classes),
+            nn.Dropout(0.2),
+            nn.Linear(classifier_input_dim // 4, num_classes),
         )
 
-    def forward(self, e_img, e_txt, tax_probs_concat):
+    def forward(self, e_img, e_txt, parent_probs_concat=None):
         """
         Args:
-            e_img:             [B, D] image embedding
-            e_txt:             [B, D] text embedding
-            tax_probs_concat:  [B, sum(tax_classes)] concatenated taxonomy
-                               probability distributions from all levels
-
-        Returns:
-            {"logits": [B, C], "gate_weights": [B, 2]}
+            e_img: [B, D]
+            e_txt: [B, D]
+            parent_probs_concat: [B, sum(parent_classes)] or None for level_1
         """
-        # Standard 2-way gating
-        concat = torch.cat([e_img, e_txt], dim=-1)
-        gate_weights = F.softmax(self.gate(concat), dim=-1)
-        z = gate_weights[:, 0:1] * e_img + gate_weights[:, 1:2] * e_txt
+        # Always use both modalities
+        z = torch.cat([e_img, e_txt], dim=-1)  # [B, 1536]
 
-        # Project taxonomy context
-        tax_emb = self.tax_projector(tax_probs_concat)
+        if self.has_parent and parent_probs_concat is not None:
+            parent_emb = self.parent_projector(parent_probs_concat)
+            z = torch.cat([z, parent_emb], dim=-1)  # [B, 1536 + proj_dim]
 
-        # Fuse and classify
-        class_input = torch.cat([z, tax_emb], dim=-1)
-        logits = self.classifier(class_input)
+        logits = self.classifier(z)
 
-        return {"logits": logits, "gate_weights": gate_weights}
+        # Return compatible format
+        B = e_img.shape[0]
+        fake_gate = torch.tensor([[0.5, 0.5]],
+                                 device=e_img.device).expand(B, -1)
+        return {"logits": logits, "gate_weights": fake_gate}
 
 
 class TaxonomyPredictor(nn.Module):
-    """Hierarchical taxonomy + taxonomy-conditioned product_class prediction.
+    """Cascading taxonomy + conditioned product_class prediction.
 
-    Taxonomy levels: independent 2-way gated heads.
-    Product class: conditioned on taxonomy probability distributions.
-        tax level probs → project → concat with gated fusion → predict class.
+    Each level receives probability distributions from ALL previous levels.
+    This narrows the search space — if level_1 says "Furniture" (high prob),
+    level_2 focuses on furniture subcategories, not lighting subcategories.
 
-    Gradient from product_class loss flows back through taxonomy probs,
-    creating mutual reinforcement between taxonomy and class predictions.
+    Product class receives ALL level probs.
+
+    Gradient flow: deeper losses → parent probs → parent heads.
+    All levels reinforce each other through backprop.
     """
 
     LEVEL_WEIGHTS = {
@@ -116,19 +106,32 @@ class TaxonomyPredictor(nn.Module):
         with open(taxonomy_path) as f:
             tax = json.load(f)
 
-        # ── Taxonomy level heads ──
+        # ── Taxonomy level heads (cascading) ──
         self.level_heads = nn.ModuleDict()
         self.level_v2i = {}
         self.level_i2v = {}
         self.level_keys = []
-        self.level_num_classes = {}  # track class counts for projector sizing
+        self.level_num_classes = {}
 
+        # Build heads — each knows the cumulative parent dim
+        cumulative_parent_dim = 0
         for level_key, values in sorted(tax.get("level_values", {}).items()):
             num_classes = len(values) + 1  # +1 for <UNK>
-            self.level_heads[level_key] = GatedHead(
-                input_dim, num_classes, hidden_factor=2)
+
+            # proj_dim scales with parent context size, clamped
+            proj_dim = min(128, max(32, cumulative_parent_dim // 2)) \
+                if cumulative_parent_dim > 0 else 0
+
+            self.level_heads[level_key] = CascadingHead(
+                input_dim=input_dim,
+                num_classes=num_classes,
+                parent_probs_dim=cumulative_parent_dim,  # 0 for level_1
+                proj_dim=proj_dim if proj_dim > 0 else 128,
+            )
+
             self.level_keys.append(level_key)
             self.level_num_classes[level_key] = num_classes
+            cumulative_parent_dim += num_classes
 
             v2i = {"<UNK>": 0}
             i2v = {0: "<UNK>"}
@@ -138,24 +141,21 @@ class TaxonomyPredictor(nn.Module):
             self.level_v2i[level_key] = v2i
             self.level_i2v[level_key] = i2v
 
-        # ── Product class head (conditioned on taxonomy) ──
+        # ── Product class head (conditioned on ALL taxonomy probs) ──
         class_values = tax.get("product_classes", [])
         if not class_values:
             class_values = []
         self.has_class_head = len(class_values) > 0
 
         if self.has_class_head:
-            num_class_labels = len(class_values) + 1  # +1 for <UNK>
+            num_class_labels = len(class_values) + 1
+            total_tax_probs_dim = sum(self.level_num_classes.values())
 
-            # Total dimension of concatenated taxonomy probability vectors
-            # e.g. level_1 has 55 classes + level_2 has 127 + ... = ~1545
-            tax_probs_dim = sum(self.level_num_classes.values())
-
-            self.class_head = TaxonomyConditionedClassHead(
+            self.class_head = CascadingHead(
                 input_dim=input_dim,
                 num_classes=num_class_labels,
-                tax_probs_dim=tax_probs_dim,
-                tax_proj_dim=256,
+                parent_probs_dim=total_tax_probs_dim,
+                proj_dim=256,
             )
 
             self.class_v2i = {"<UNK>": 0}
@@ -165,33 +165,90 @@ class TaxonomyPredictor(nn.Module):
                 self.class_i2v[i + 1] = val
 
     def forward(self, e_img, e_txt):
-        """Forward pass: taxonomy levels first, then conditioned product_class.
+        """Cascading forward: each level feeds into the next.
 
         Returns:
             dict of {head_name: {"logits": [B, C], "gate_weights": [B, 2]}}
         """
         results = {}
+        all_probs = []
 
-        # Step 1: Run all taxonomy level heads
-        tax_probs_list = []
+        # Run levels in order — each receives cumulative parent probs
+        parent_probs_concat = None
         for k in self.level_keys:
-            head_out = self.level_heads[k](e_img, e_txt)
+            head_out = self.level_heads[k](e_img, e_txt, parent_probs_concat)
             results[k] = head_out
 
-            # Collect probability distributions for product_class conditioning
-            # Use softmax on logits — these are differentiable, so gradients
-            # from product_class loss flow back into taxonomy heads
-            probs = F.softmax(head_out["logits"], dim=-1)  # [B, C_level]
-            tax_probs_list.append(probs)
+            # Softmax probs (differentiable — gradients flow back)
+            probs = F.softmax(head_out["logits"], dim=-1)
+            all_probs.append(probs)
 
-        # Step 2: Run product_class head conditioned on taxonomy distributions
+            # Build cumulative context for next level
+            parent_probs_concat = torch.cat(all_probs, dim=-1)
+
+        # Product class: conditioned on ALL level probs
         if self.has_class_head:
-            # Concatenate all taxonomy probs: [B, sum(C_levels)]
-            tax_probs_concat = torch.cat(tax_probs_list, dim=-1)
+            all_tax_probs = torch.cat(all_probs, dim=-1)
             results["product_class"] = self.class_head(
-                e_img, e_txt, tax_probs_concat)
+                e_img, e_txt, all_tax_probs)
 
         return results
+
+    def compute_class_weights(self, products, smoothing=0.1):
+        """Compute inverse-frequency class weights from training data.
+
+        Call once: model.taxonomy_heads.compute_class_weights(queue_products)
+        """
+        from collections import Counter
+
+        self.class_weights = {}
+
+        # Taxonomy level weights
+        for level_key, v2i in self.level_v2i.items():
+            num_classes = len(v2i)
+            counts = Counter()
+            level_idx = int(level_key.split("_")[1]) - 1  # "level_1" → 0
+
+            for p in products:
+                tax = p.get("taxonomy", [])
+                if level_idx < len(tax):
+                    val = tax[level_idx]
+                    idx = v2i.get(val, 0)
+                    counts[idx] += 1
+
+            total = sum(counts.values())
+            if total == 0:
+                continue
+
+            weights = torch.ones(num_classes)
+            for cls_idx in range(num_classes):
+                c = counts.get(cls_idx, 0)
+                if c > 0:
+                    weights[cls_idx] = (total / (num_classes * c)) ** 0.5
+
+            weights = weights / weights.mean()
+            self.class_weights[level_key] = weights
+
+        # Product class weights
+        if self.has_class_head:
+            counts = Counter()
+            for p in products:
+                pc = p.get("product_class")
+                if pc and pc in self.class_v2i:
+                    counts[self.class_v2i[pc]] += 1
+
+            total = sum(counts.values())
+            if total > 0:
+                num_classes = len(self.class_v2i)
+                weights = torch.ones(num_classes)
+                for cls_idx in range(num_classes):
+                    c = counts.get(cls_idx, 0)
+                    if c > 0:
+                        weights[cls_idx] = (total / (num_classes * c)) ** 0.5
+                weights = weights / weights.mean()
+                self.class_weights["product_class"] = weights
+
+        print(f"  Taxonomy class weights computed for {len(self.class_weights)} heads")
 
     def compute_loss(self, logits_dict, labels_dict):
         """Compute weighted multi-task loss for taxonomy + product_class."""
@@ -199,7 +256,6 @@ class TaxonomyPredictor(nn.Module):
         total_loss = torch.tensor(0.0, device=device)
         per_head = {}
 
-        # Taxonomy level losses
         for level_key, head_out in logits_dict.items():
             if level_key == "product_class":
                 continue
@@ -211,21 +267,31 @@ class TaxonomyPredictor(nn.Module):
             if not valid.any():
                 continue
 
-            weight = self.LEVEL_WEIGHTS.get(level_key, 0.5)
+            level_weight = self.LEVEL_WEIGHTS.get(level_key, 0.5)
+
+            cls_weight = None
+            if hasattr(self, 'class_weights') and level_key in self.class_weights:
+                cls_weight = self.class_weights[level_key].to(device)
+
             loss = F.cross_entropy(
                 head_out["logits"][valid], labels[valid],
+                weight=cls_weight,
                 reduction="mean", label_smoothing=0.1)
-            total_loss = total_loss + weight * loss
+            total_loss = total_loss + level_weight * loss
             per_head[level_key] = loss.item()
 
-        # Product class loss (gradients flow back through taxonomy probs)
         if "product_class" in logits_dict and "product_class" in labels_dict:
             labels = labels_dict["product_class"]
             valid = labels >= 0
             if valid.any():
+                cls_weight = None
+                if hasattr(self, 'class_weights') and "product_class" in self.class_weights:
+                    cls_weight = self.class_weights["product_class"].to(device)
+
                 loss = F.cross_entropy(
                     logits_dict["product_class"]["logits"][valid],
                     labels[valid],
+                    weight=cls_weight,
                     reduction="mean", label_smoothing=0.1)
                 total_loss = total_loss + self.PRODUCT_CLASS_WEIGHT * loss
                 per_head["product_class"] = loss.item()
@@ -233,7 +299,7 @@ class TaxonomyPredictor(nn.Module):
         return total_loss, per_head
 
     def predict(self, e_img, e_txt, confidence_threshold=0.5):
-        """Predict taxonomy levels and product_class with confidence scores."""
+        """Predict taxonomy levels and product_class with confidence."""
         logits_dict = self.forward(e_img, e_txt)
         B = e_img.shape[0]
         results = [{} for _ in range(B)]

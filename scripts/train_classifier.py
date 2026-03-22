@@ -33,7 +33,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from src.classifier.dataset import build_dataloaders
 from src.classifier.attribute_head import AttributePredictor
 from src.classifier.taxonomy_head import TaxonomyPredictor
-
+# from src.classifier.gated_head import compute_gate_entropy
 
 # ════════════════════════════════════════════════════════════════
 # Encoders
@@ -62,15 +62,25 @@ class TextEncoder(nn.Module):
 
 
 class ImageEncoder(nn.Module):
-    """Frozen CLIP ViT + trainable attention pooler."""
-
     def __init__(self, model_name="openai/clip-vit-base-patch32",
-                 output_dim=768):
+                 output_dim=768, unfreeze_layers=3):
         super().__init__()
         from transformers import CLIPVisionModel
         self.model = CLIPVisionModel.from_pretrained(model_name)
+        
+        # Freeze everything first
         for p in self.model.parameters():
             p.requires_grad = False
+        
+        # Unfreeze last N transformer layers for fine-grained learning
+        encoder_layers = self.model.vision_model.encoder.layers
+        for layer in encoder_layers[-unfreeze_layers:]:
+            for p in layer.parameters():
+                p.requires_grad = True
+        
+        # Unfreeze the final layer norm too
+        for p in self.model.vision_model.post_layernorm.parameters():
+            p.requires_grad = True
 
         clip_dim = self.model.config.hidden_size
         self.output_dim = output_dim
@@ -142,7 +152,7 @@ class ProductClassifier(nn.Module):
 
         tax_out = self.taxonomy_heads(e_img, e_txt)
         attr_out = self.attribute_heads(e_img, e_txt)
-
+        
         return {
             "taxonomy": tax_out,
             "attributes": attr_out,
@@ -176,7 +186,9 @@ def train_one_epoch(model, loader, optimizer, device, epoch):
         attr_loss, attr_det = model.attribute_heads.compute_loss(
             out["attributes"], attr_labels)
 
-        loss = tax_loss + attr_loss
+        # gate_reg = compute_gate_entropy(out["attributes"]) + compute_gate_entropy(out["taxonomy"])
+        # loss = tax_loss + attr_loss + 0.1 * gate_reg
+        loss = tax_loss + attr_loss 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
@@ -323,11 +335,30 @@ def main():
     total = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {trainable:,} trainable / {total:,} total")
 
-    optimizer = AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=args.lr, weight_decay=0.01)
+    # optimizer = AdamW(
+    #     [p for p in model.parameters() if p.requires_grad],
+    #     lr=args.lr, weight_decay=0.01)
+    # scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
+    # Differential LR: CLIP fine-tune layers get 10x lower LR
+    clip_params = []
+    head_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if 'image_encoder.model' in name:
+            clip_params.append(param)
+        else:
+            head_params.append(param)
+    
+    optimizer = AdamW([
+        {"params": clip_params, "lr": args.lr * 0.1},   # 5e-6 for CLIP
+        {"params": head_params, "lr": args.lr},          # 5e-5 for heads
+    ], weight_decay=0.01)
+    
+    print(f"  CLIP params (unfrozen): {sum(p.numel() for p in clip_params):,}")
+    print(f"  Head params:            {sum(p.numel() for p in head_params):,}")
+    
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
-
     best_val = float("inf")
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()

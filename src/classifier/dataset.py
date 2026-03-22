@@ -210,16 +210,20 @@ class ProductClassifierDataset(Dataset):
         max_images=2,
         image_size=224,
         # Text level probabilities
-        text_full_prob=0.15,
-        text_partial_prob=0.15,
-        text_name_prob=0.30,
-        text_minimal_prob=0.20,
-        text_empty_prob=0.20,
+        # OLD: 70% heavily degraded → gate learns "text = garbage, use image"
+        # NEW: 40% degraded → gate can learn text is useful for assembly/style
+        text_full_prob=0.35,
+        text_partial_prob=0.25,
+        text_name_prob=0.20,
+        text_minimal_prob=0.10,
+        text_empty_prob=0.10,
         # Per-attribute mask probabilities
-        color_mask_prob=0.50,
-        shape_mask_prob=0.40,
-        style_mask_prob=0.20,
-        material_mask_prob=0.15,
+        # With ConcatHead (no gate), heavy masking destroys useful signal.
+        # Light masking for regularization only.
+        color_mask_prob=0.10,
+        shape_mask_prob=0.0,       # shape is image-only, no text to mask
+        style_mask_prob=0.10,
+        material_mask_prob=0.10,
         # assembly_mask_prob = 0.0 (NEVER)
     ):
         super().__init__()
@@ -287,8 +291,11 @@ class ProductClassifierDataset(Dataset):
 
     def _index_images(self):
         self.n_with_images = 0
+        checked_dirs = 0
+        first_missing = []
+
         for p in self.products:
-            pid = p["product_id"]
+            pid = str(p["product_id"])
             pdir = self.image_dir / pid
             hero = next(
                 (pdir / f"hero.{e}" for e in ("jpg", "png", "webp")
@@ -301,6 +308,27 @@ class ProductClassifierDataset(Dataset):
             p["_has_img"] = hero is not None
             if hero:
                 self.n_with_images += 1
+            elif len(first_missing) < 3:
+                first_missing.append((pid, str(pdir)))
+            checked_dirs += 1
+
+        # Diagnostic: help debug "0 with images"
+        if self.n_with_images == 0 and len(self.products) > 0:
+            print(f"\n  WARNING: 0 images found!")
+            print(f"  image_dir: {self.image_dir}")
+            print(f"  image_dir exists: {self.image_dir.exists()}")
+            if self.image_dir.exists():
+                subdirs = list(self.image_dir.iterdir())[:5]
+                print(f"  sample subdirs in image_dir: {[s.name for s in subdirs]}")
+                if subdirs:
+                    sample_files = list(subdirs[0].iterdir())[:5]
+                    print(f"  files in {subdirs[0].name}/: {[f.name for f in sample_files]}")
+            print(f"  sample product_ids from queue: "
+                  f"{[p['product_id'] for p in self.products[:5]]}")
+            print(f"  expected paths (first 3 missing):")
+            for pid, pdir in first_missing:
+                print(f"    {pdir}/hero.jpg")
+            print()
 
     def __len__(self):
         return len(self.products)
@@ -496,6 +524,82 @@ def load_descriptions(tsv_path):
     return desc_map
 
 
+def stratified_split(products, val_split=0.1, seed=42):
+    """Split products ensuring every attribute value appears in both sets.
+
+    Strategy:
+      1. For each product, compute a stratification key from its rarest
+         attribute value (the value most at risk of being missing from val)
+      2. Group products by this key
+      3. Within each group, split proportionally
+
+    This guarantees even coral(18), scandinavian(25), runner(30) etc.
+    get ~10% in val instead of randomly getting 0.
+    """
+    from collections import Counter, defaultdict
+
+    rng = random.Random(seed)
+
+    # Count frequency of each value across all attributes
+    attr_cols = ["primary_color", "primary_material", "style",
+                 "shape", "assembly"]
+    value_counts = Counter()
+    for p in products:
+        for attr in attr_cols:
+            v = p.get(attr)
+            if v:
+                value_counts[f"{attr}={v}"] += 1
+
+    # Assign each product a stratification key = its rarest attribute value
+    # This ensures rare values get proportional representation
+    def strat_key(p):
+        rarest = None
+        rarest_count = float("inf")
+        for attr in attr_cols:
+            v = p.get(attr)
+            if v:
+                key = f"{attr}={v}"
+                c = value_counts.get(key, 0)
+                if c < rarest_count:
+                    rarest_count = c
+                    rarest = key
+        return rarest or "_none_"
+
+    # Group by stratification key
+    groups = defaultdict(list)
+    for i, p in enumerate(products):
+        groups[strat_key(p)].append(i)
+
+    # Split each group proportionally
+    train_idx = []
+    val_idx = []
+    for key, indices in groups.items():
+        rng.shuffle(indices)
+        n_val = max(1, int(len(indices) * val_split))
+        # Ensure at least 1 in val AND at least 1 in train
+        if n_val >= len(indices):
+            n_val = max(1, len(indices) - 1)
+        val_idx.extend(indices[:n_val])
+        train_idx.extend(indices[n_val:])
+
+    # Report
+    print(f"  Stratified split: {len(groups)} strata, "
+          f"train={len(train_idx)}, val={len(val_idx)}")
+
+    # Verify coverage
+    for attr in attr_cols:
+        train_vals = set(products[i].get(attr) for i in train_idx
+                        if products[i].get(attr))
+        val_vals = set(products[i].get(attr) for i in val_idx
+                      if products[i].get(attr))
+        missing = train_vals - val_vals
+        if missing:
+            print(f"    WARNING: {attr} — {len(missing)} values in train "
+                  f"but not val: {missing}")
+
+    return train_idx, val_idx
+
+
 def build_dataloaders(
     queue_path, image_dir, vocab_path, taxonomy_path,
     tsv_path=None, batch_size=32, val_split=0.1, num_workers=4,
@@ -511,13 +615,12 @@ def build_dataloaders(
         queue_path, image_dir, vocab_path, taxonomy_path,
         description_map=desc_map, train=True, **kwargs)
 
-    n = len(full)
-    idx = list(range(n))
-    random.shuffle(idx)
-    vs = int(n * val_split)
+    # Stratified split — ensures all attribute values in both sets
+    train_idx, val_idx = stratified_split(
+        full.products, val_split=val_split)
 
     train_loader = DataLoader(
-        Subset(full, idx[vs:]), batch_size=batch_size, shuffle=True,
+        Subset(full, train_idx), batch_size=batch_size, shuffle=True,
         num_workers=num_workers, collate_fn=collate_fn,
         pin_memory=True, drop_last=True)
 
@@ -528,8 +631,8 @@ def build_dataloaders(
         image_size=kwargs.get("image_size", 224))
 
     val_loader = DataLoader(
-        Subset(val_ds, idx[:vs]), batch_size=batch_size, shuffle=False,
+        Subset(val_ds, val_idx), batch_size=batch_size, shuffle=False,
         num_workers=num_workers, collate_fn=collate_fn, pin_memory=True)
 
-    print(f"Train: {n - vs}, Val: {vs}, Batch: {batch_size}")
+    print(f"Train: {len(train_idx)}, Val: {len(val_idx)}, Batch: {batch_size}")
     return train_loader, val_loader

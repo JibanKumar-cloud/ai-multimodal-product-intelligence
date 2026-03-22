@@ -1,43 +1,186 @@
 #!/usr/bin/env python3
-"""Wayfair Catalog AI - Unified Demo App.
-Tab 1: Attribute Extraction (VLM, rule-based, hybrid)
+"""Wayfair Product Intelligence — Demo App.
+
+Three extraction modes:
+  1. VLM Only (LLaVA)        — Full VLM extraction (~2s)
+  2. Classifier Only          — Multi-tower model (~50ms)
+  3. Classifier + VLM Fallback — Fast classifier, LLaVA for low confidence
+
 Tab 2: Product Search (bi-encoder -> cross-encoder -> attribute boost)
 
 Usage:
     streamlit run demo/app.py --server.port 8501 --server.address 0.0.0.0
 """
 from __future__ import annotations
-import json, sys, time
+import json, sys, time, os
 from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 try:
     import streamlit as st
 except ImportError:
-    print("pip install streamlit"); sys.exit(1)
+    print("pip install streamlit")
+    sys.exit(1)
 
-EXTRACTION_MODELS = {
-    "Rule-based (instant)": {"type": "rule-based", "path": None},
-    "LLaVA QLoRA [Multimodal]": {"type": "llava", "path": "outputs/checkpoints/qlora-multimodal/best_model"},
-    "LLaVA QLoRA [Text-Only]": {"type": "llava", "path": "outputs/checkpoints/qlora-text-only/best_model"},
-    "LLaVA QLoRA [Vague+Image]": {"type": "llava", "path": "outputs/checkpoints/qlora-vague-multimodal/best_model"},
-    "Hybrid (Visual + Text)": {"type": "hybrid", "path": "outputs/checkpoints/qlora-vague-multimodal/best_model"},
-    "GPT-4o (API key required)": {"type": "gpt4o", "path": None},
+import torch
+from PIL import Image
+
+# ================================================================
+# CONFIG
+# ================================================================
+
+LLAVA_ADAPTERS = {
+    "LLaVA Multimodal": "outputs/checkpoints/qlora-multimodal/best_model",
+    "LLaVA Text-Only": "outputs/checkpoints/qlora-text-only/best_model",
+    "LLaVA Vague+Image": "outputs/checkpoints/qlora-vague-multimodal/best_model",
 }
 
-# ── Cached loaders ──
+CLASSIFIER_PATHS = {
+    "checkpoint": "checkpoints/best_model.pt",
+    "taxonomy": "data/processed/taxonomy_tree.json",
+    "vocab": "data/processed/attribute_vocab.json",
+}
+
+ATTR_ORDER = [
+    "primary_color", "secondary_color",
+    "primary_material", "secondary_material",
+    "style", "shape", "assembly",
+]
+
+CONFIDENCE_COLORS = {"high": "#22c55e", "medium": "#f59e0b", "low": "#ef4444"}
+
+# ================================================================
+# TAXONOMY HIERARCHY VALIDATION
+# ================================================================
+
+@st.cache_resource
+def build_taxonomy_hierarchy(queue_path="data/processed/image_queue_with_images.json"):
+    """Build parent→valid_children map from training data.
+
+    Returns:
+        valid_children: {("level_1", "Furniture"): {"Living Room Furniture", ...}}
+        max_depth: {product_class: typical_depth}  e.g. "Sectionals": 3
+    """
+    if not Path(queue_path).exists():
+        return {}, {}
+
+    with open(queue_path) as f:
+        queue = json.load(f)
+
+    valid_children = {}   # (parent_level, parent_value) → set of child values
+    class_depths = {}     # product_class → max observed depth
+
+    for p in queue:
+        taxonomy = p.get("taxonomy", [])
+        pc = p.get("product_class", "")
+
+        # Track depths per product class
+        if pc and len(taxonomy) > 0:
+            class_depths[pc] = max(class_depths.get(pc, 0), len(taxonomy))
+
+        # Build parent→child edges
+        for i in range(len(taxonomy) - 1):
+            parent_key = (f"level_{i+1}", taxonomy[i])
+            child_val = taxonomy[i + 1]
+            if parent_key not in valid_children:
+                valid_children[parent_key] = set()
+            valid_children[parent_key].add(child_val)
+
+    # Also map product_class → valid parent level values
+    pc_parents = {}
+    for p in queue:
+        taxonomy = p.get("taxonomy", [])
+        pc = p.get("product_class", "")
+        if pc and taxonomy:
+            # Product class should be a child of the deepest level
+            deepest = (f"level_{len(taxonomy)}", taxonomy[-1])
+            if deepest not in pc_parents:
+                pc_parents[deepest] = set()
+            pc_parents[deepest].add(pc)
+
+    return valid_children, class_depths
+
+
+def validate_taxonomy_chain(taxonomy_dict, valid_children):
+    """Validate taxonomy predictions and truncate where chain breaks.
+
+    Rules:
+        1. level_1 always kept (root)
+        2. level_N kept only if its value is a valid child of level_(N-1)
+        3. Stop at first break — everything after is invalid
+        4. Also stop if confidence drops below 0.15 (random guessing)
+
+    Returns:
+        validated: dict of valid levels only
+        depth: number of valid levels
+    """
+    if not taxonomy_dict:
+        return {}, 0
+
+    validated = {}
+    sorted_levels = sorted(
+        ((k, v) for k, v in taxonomy_dict.items() if k.startswith("level_")),
+        key=lambda x: int(x[0].split("_")[1])
+    )
+
+    prev_level = None
+    prev_value = None
+
+    for lk, info in sorted_levels:
+        value = info["value"]
+        conf = info.get("confidence", 0)
+
+        # Skip <UNK> predictions
+        if value == "<UNK>":
+            break
+
+        # level_1: always accept
+        if prev_level is None:
+            validated[lk] = info
+            prev_level = lk
+            prev_value = value
+            continue
+
+        # Check if this value is a valid child of previous level
+        parent_key = (prev_level, prev_value)
+        children = valid_children.get(parent_key, set())
+
+        if children and value not in children:
+            # Invalid child — chain is broken, stop here
+            break
+
+        if not children:
+            # No known children for this parent — taxonomy ends here.
+            # Don't trust confidence — levels with 1 class show 99%.
+            break
+
+        # Confidence too low — probably random
+        if conf < 0.15:
+            break
+
+        validated[lk] = info
+        prev_level = lk
+        prev_value = value
+
+    return validated, len(validated)
+
+# ================================================================
+# CACHED MODEL LOADERS
+# ================================================================
 
 @st.cache_resource
 def load_llava_model(adapter_path):
-    import torch
-    from transformers import AutoTokenizer, AutoProcessor, LlavaForConditionalGeneration, BitsAndBytesConfig
+    from transformers import (AutoTokenizer, AutoProcessor,
+                              LlavaForConditionalGeneration, BitsAndBytesConfig)
     from peft import PeftModel
     base_model = "llava-hf/llava-1.5-7b-hf"
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16,
         bnb_4bit_use_double_quant=True, bnb_4bit_quant_type="nf4")
     model = LlavaForConditionalGeneration.from_pretrained(
-        base_model, quantization_config=bnb_config, device_map="auto", torch_dtype=torch.float16)
+        base_model, quantization_config=bnb_config,
+        device_map="auto", torch_dtype=torch.float16)
     model = PeftModel.from_pretrained(model, adapter_path)
     model.eval()
     tokenizer = AutoTokenizer.from_pretrained(base_model)
@@ -45,6 +188,25 @@ def load_llava_model(adapter_path):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     return model, tokenizer, processor
+
+@st.cache_resource
+def load_classifier():
+    try:
+        from scripts.train_classifier import ProductClassifier
+    except ImportError:
+        return None, None, None
+    paths = CLASSIFIER_PATHS
+    if not all(Path(p).exists() for p in paths.values()):
+        return None, None, None
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = ProductClassifier(
+        taxonomy_path=paths["taxonomy"], vocab_path=paths["vocab"]).to(device)
+    ckpt = torch.load(paths["checkpoint"], map_location=device, weights_only=False)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+    meta = {"epoch": ckpt.get("epoch", "?"), "val_loss": ckpt.get("val_loss", 0),
+            "accuracy": ckpt.get("accuracy", {})}
+    return model, device, meta
 
 @st.cache_resource
 def load_search_pipeline():
@@ -57,8 +219,7 @@ def load_search_pipeline():
     from src.search.pipeline import SearchPipeline
     try:
         return SearchPipeline.from_config(config)
-    except Exception as e:
-        print(f"Search pipeline load failed: {e}")
+    except Exception:
         return None
 
 @st.cache_resource
@@ -72,23 +233,21 @@ def load_bm25():
     except Exception:
         return None
 
-# ── Extraction functions ──
+# ================================================================
+# EXTRACTION: VLM (LLaVA)
+# ================================================================
 
-def extract_rule_based(name, desc, cls):
-    from src.models.rule_based import RuleBasedExtractor
-    return RuleBasedExtractor().extract(product_name=name, product_description=desc, product_class=cls)
-
-def extract_llava(name, desc, cls, adapter_path, image_file=None):
-    import torch
-    from PIL import Image
+def extract_vlm(name, desc, product_class, image_file, adapter_path):
     from src.inference.postprocessor import PostProcessor
     model, tokenizer, processor = load_llava_model(adapter_path)
     pp = PostProcessor()
-    input_text = f"Product: {name}\nCategory: {cls}\nDescription: {desc}"[:300]
+    input_text = f"Product: {name}\nCategory: {product_class}\nDescription: {desc}"[:300]
+
     if image_file is not None:
         prompt = (
             "You are a product catalog specialist. You are given a product image "
-            "and its text listing. Extract structured attributes by analyzing BOTH the image and the text.\n\n"
+            "and its text listing. Extract structured attributes by analyzing BOTH "
+            "the image and the text.\n\n"
             "Example output format:\n"
             '{"style": "modern & contemporary", "primary_material": "wood", '
             '"secondary_material": null, "color_family": "brown", '
@@ -107,266 +266,486 @@ def extract_llava(name, desc, cls, adapter_path, image_file=None):
             '"room_type": "living room", "product_type": "table", '
             '"assembly_required": true}\n\n'
             f"{input_text}\n\nExtracted attributes (JSON):")
-        inputs = tokenizer(prompt, return_tensors="pt", max_length=512, truncation=True).to(model.device)
+        inputs = tokenizer(prompt, return_tensors="pt", max_length=512,
+                           truncation=True).to(model.device)
+
     with torch.inference_mode():
         outputs = model.generate(
             **inputs, max_new_tokens=300, do_sample=False,
             pad_token_id=tokenizer.eos_token_id)
     generated = outputs[0][inputs["input_ids"].shape[1]:]
     raw = tokenizer.decode(generated, skip_special_tokens=True)
-    print(f"\nRAW: {raw[:500]}\n")
     parsed = pp.process(raw)
-    return parsed
+    return parsed, raw
 
-def extract_hybrid(name, desc, cls, adapter_path, image_file=None):
-    from src.models.rule_based import RuleBasedExtractor
-    visual = extract_llava(name, desc, cls, adapter_path, image_file)
-    text_attrs = RuleBasedExtractor().extract(
-        product_name=name, product_description=desc, product_class=cls)
-    VISUAL_KEYS = {"style", "primary_material", "color_family", "product_type"}
-    TEXT_KEYS = {"secondary_material", "room_type", "assembly_required"}
-    merged = {}
-    for key in VISUAL_KEYS:
-        merged[key] = visual.get(key) if visual.get(key) is not None else text_attrs.get(key)
-    for key in TEXT_KEYS:
-        merged[key] = text_attrs.get(key)
-    return merged
+# ================================================================
+# EXTRACTION: CLASSIFIER
+# ================================================================
 
-def extract_gpt4o(name, desc, cls):
-    import os
-    if not os.getenv("OPENAI_API_KEY"):
-        return {"error": "Set OPENAI_API_KEY"}
-    from src.models.gpt4o_extractor import GPT4oExtractor
-    return GPT4oExtractor().extract(product_name=name, product_description=desc, product_class=cls)
+def extract_classifier(name, desc, product_class, image_file,
+                       confidence_threshold=0.5):
+    from src.classifier.dataset import get_image_transforms
+    model, device, meta = load_classifier()
+    if model is None:
+        return None, None
+    transform = get_image_transforms(train=False)
+    t0 = time.time()
 
-def _run_extraction(cfg, name, desc, cls, image):
-    if cfg["type"] == "rule-based":
-        return extract_rule_based(name, desc, cls)
-    elif cfg["type"] == "llava":
-        return extract_llava(name, desc, cls, cfg["path"], image)
-    elif cfg["type"] == "hybrid":
-        return extract_hybrid(name, desc, cls, cfg["path"], image)
-    elif cfg["type"] == "gpt4o":
-        return extract_gpt4o(name, desc, cls)
-    return {"error": "Unknown model"}
+    parts = [name]
+    if product_class:
+        parts.append(product_class)
+    if desc:
+        parts.append(desc[:200])
+    text = " [SEP] ".join(parts)
 
-# ── UI helpers ──
+    images, mask = [], []
+    if image_file is not None:
+        try:
+            img = transform(Image.open(image_file).convert("RGB"))
+            images.append(img)
+            mask.append(True)
+        except Exception:
+            pass
+    while len(images) < 2:
+        images.append(torch.zeros(3, 224, 224))
+        mask.append(False)
 
-def show_extraction_result(result):
-    if "error" in result:
-        st.error(result["error"])
+    batch = {
+        "text_input": [text],
+        "images": torch.stack(images).unsqueeze(0).to(device),
+        "image_mask": torch.tensor(mask[:2]).unsqueeze(0).to(device),
+    }
+    with torch.inference_mode():
+        out = model(batch)
+    classifier_ms = (time.time() - t0) * 1000
+
+    result = {"_meta": {"latency_ms": round(classifier_ms, 1),
+                        "model_epoch": meta.get("epoch", "?")},
+              "taxonomy": {}, "product_class": None,
+              "attributes": {}, "vlm_needed": []}
+
+    for lk in model.taxonomy_heads.level_keys:
+        if lk not in out["taxonomy"]:
+            continue
+        head_out = out["taxonomy"][lk]
+        probs = torch.softmax(head_out["logits"], dim=-1)
+        conf, pred = probs.max(-1)
+        value = model.taxonomy_heads.level_i2v[lk].get(pred[0].item(), "<UNK>")
+        c = conf[0].item()
+        result["taxonomy"][lk] = {"value": value, "confidence": round(c, 3)}
+        if c < confidence_threshold:
+            result["vlm_needed"].append(lk)
+
+    # Validate taxonomy chain — remove levels that break hierarchy
+    valid_children, _ = build_taxonomy_hierarchy()
+    validated_tax, depth = validate_taxonomy_chain(
+        result["taxonomy"], valid_children)
+
+    # Remove invalid levels from vlm_needed too
+    removed = set(result["taxonomy"].keys()) - set(validated_tax.keys())
+    result["vlm_needed"] = [f for f in result["vlm_needed"] if f not in removed]
+    result["taxonomy"] = validated_tax
+    result["_meta"]["taxonomy_depth"] = depth
+
+    if model.taxonomy_heads.has_class_head and "product_class" in out["taxonomy"]:
+        head_out = out["taxonomy"]["product_class"]
+        probs = torch.softmax(head_out["logits"], dim=-1)
+        conf, pred = probs.max(-1)
+        value = model.taxonomy_heads.class_i2v.get(pred[0].item(), "<UNK>")
+        c = conf[0].item()
+        result["product_class"] = {"value": value, "confidence": round(c, 3)}
+        if c < confidence_threshold:
+            result["vlm_needed"].append("product_class")
+
+    for attr, head_out in out["attributes"].items():
+        probs = torch.softmax(head_out["logits"], dim=-1)
+        conf, pred = probs.max(-1)
+        value = model.attribute_heads.idx_to_value[attr].get(pred[0].item(), "<UNK>")
+        c = conf[0].item()
+        result["attributes"][attr] = {"value": value, "confidence": round(c, 3)}
+        if c < confidence_threshold:
+            result["vlm_needed"].append(attr)
+
+    return result, out
+
+# ================================================================
+# EXTRACTION: HYBRID (Classifier + VLM Fallback)
+# ================================================================
+
+def extract_hybrid(name, desc, product_class, image_file,
+                   adapter_path, confidence_threshold=0.5):
+    cls_result, _ = extract_classifier(
+        name, desc, product_class, image_file, confidence_threshold)
+    if cls_result is None:
+        vlm_result, raw = extract_vlm(name, desc, product_class, image_file, adapter_path)
+        return {"mode": "vlm_only (classifier unavailable)",
+                "attributes": vlm_result, "vlm_fields": "all",
+                "latency_classifier_ms": 0, "latency_vlm_ms": None}
+
+    vlm_fields = cls_result["vlm_needed"]
+    hybrid = {"mode": "hybrid", "taxonomy": cls_result["taxonomy"],
+              "product_class": cls_result["product_class"],
+              "attributes": {}, "field_sources": {},
+              "vlm_fields": vlm_fields,
+              "latency_classifier_ms": cls_result["_meta"]["latency_ms"],
+              "latency_vlm_ms": 0}
+
+    for attr, info in cls_result["attributes"].items():
+        hybrid["attributes"][attr] = info
+        hybrid["field_sources"][attr] = "classifier"
+
+    if vlm_fields:
+        t0 = time.time()
+        vlm_result, _ = extract_vlm(name, desc, product_class, image_file, adapter_path)
+        hybrid["latency_vlm_ms"] = round((time.time() - t0) * 1000, 1)
+        for field in vlm_fields:
+            if field in vlm_result and vlm_result[field] is not None:
+                if field in hybrid["attributes"]:
+                    hybrid["attributes"][field] = {
+                        "value": vlm_result[field], "confidence": None, "source": "vlm"}
+                    hybrid["field_sources"][field] = "vlm"
+
+    return hybrid
+
+# ================================================================
+# UI HELPERS
+# ================================================================
+
+def conf_color(conf):
+    if conf is None: return "#6b7280"
+    if conf >= 0.7: return CONFIDENCE_COLORS["high"]
+    if conf >= 0.4: return CONFIDENCE_COLORS["medium"]
+    return CONFIDENCE_COLORS["low"]
+
+def conf_label(conf):
+    if conf is None: return "VLM"
+    if conf >= 0.7: return "HIGH"
+    if conf >= 0.4: return "MED"
+    return "LOW"
+
+def _card(label, value, conf=None, source=None, vlm_flag=False):
+    color = conf_color(conf)
+    src_tag = ""
+    if source == "vlm":
+        src_tag = " — 🔄 VLM"
+    elif source == "classifier":
+        src_tag = " — ⚡ Fast"
+    elif vlm_flag:
+        src_tag = " 🔄"
+    conf_text = f"{conf:.0%} {conf_label(conf)}" if conf else "VLM"
+    if isinstance(value, str):
+        value = value.replace("_", " ").title()
+    return (
+        f"<div style='padding:10px; border-radius:8px; "
+        f"background:#1e293b; margin:4px 0; "
+        f"border-left: 4px solid {color};'>"
+        f"<small style='color:#94a3b8;'>{label}{src_tag}</small><br>"
+        f"<b style='color:#f8fafc; font-size:1.1em;'>{value}</b>"
+        f"<br><small style='color:{color};'>{conf_text}</small>"
+        f"</div>"
+    )
+
+def show_vlm_result(result, raw_output=None):
+    if not result or "error" in result:
+        st.warning("No attributes extracted" if not result else result["error"])
         return
-    if not result:
-        st.warning("No attributes extracted")
-        return
+    cols = st.columns(3)
+    i = 0
     for attr, value in result.items():
-        if value is not None:
-            if isinstance(value, list):
-                v = ", ".join(value)
-            elif isinstance(value, bool):
-                v = "Yes" if value else "No"
-            else:
-                v = str(value).title()
-            st.metric(label=attr.replace("_", " ").title(), value=v)
-    st.markdown("---")
-    st.json(result)
+        if value is None or attr.startswith("_"):
+            continue
+        with cols[i % 3]:
+            st.markdown(_card(attr.replace("_", " ").title(),
+                              str(value)), unsafe_allow_html=True)
+        i += 1
+    with st.expander("Raw JSON"):
+        st.json(result)
+    if raw_output:
+        with st.expander("Raw model output"):
+            st.code(raw_output, language="text")
+
+def show_classifier_result(result):
+    if result is None:
+        st.warning("Classifier not available")
+        return
+    meta = result.get("_meta", {})
+    st.caption(f"⚡ {meta.get('latency_ms', '?')}ms | Epoch {meta.get('model_epoch', '?')}")
+
+    st.markdown("##### Taxonomy")
+    cols = st.columns(3)
+    for i, (lk, info) in enumerate(sorted(result.get("taxonomy", {}).items())):
+        with cols[i % 3]:
+            vlm = lk in result.get("vlm_needed", [])
+            st.markdown(_card(lk, info["value"], info["confidence"],
+                              vlm_flag=vlm), unsafe_allow_html=True)
+
+    pc = result.get("product_class")
+    if pc:
+        vlm = "product_class" in result.get("vlm_needed", [])
+        st.markdown(_card("Product Class", pc["value"], pc["confidence"],
+                          vlm_flag=vlm), unsafe_allow_html=True)
+
+    st.markdown("##### Attributes")
+    cols = st.columns(3)
+    for i, attr in enumerate(ATTR_ORDER):
+        info = result.get("attributes", {}).get(attr)
+        if not info:
+            continue
+        with cols[i % 3]:
+            vlm = attr in result.get("vlm_needed", [])
+            st.markdown(_card(attr.replace("_", " ").title(),
+                              info["value"], info["confidence"],
+                              vlm_flag=vlm), unsafe_allow_html=True)
+
+    n_vlm = len(result.get("vlm_needed", []))
+    total = (len(result.get("taxonomy", {})) + (1 if pc else 0) +
+             len(result.get("attributes", {})))
+    if n_vlm > 0:
+        st.info(f"🔄 VLM fallback recommended for **{n_vlm}/{total}** fields")
+    else:
+        st.success(f"✅ All {total} fields above confidence threshold")
+
+    with st.expander("Raw JSON"):
+        st.json(result)
+
+def show_hybrid_result(result):
+    if result is None:
+        st.warning("No result")
+        return
+    cls_ms = result.get("latency_classifier_ms", 0)
+    vlm_ms = result.get("latency_vlm_ms", 0)
+    vlm_fields = result.get("vlm_fields", [])
+
+    st.caption(f"⚡ Classifier: {cls_ms:.0f}ms | 🔄 VLM: {vlm_ms:.0f}ms | "
+               f"Total: {cls_ms + vlm_ms:.0f}ms")
+
+    st.markdown("##### Taxonomy")
+    cols = st.columns(3)
+    for i, (lk, info) in enumerate(sorted(result.get("taxonomy", {}).items())):
+        with cols[i % 3]:
+            src = "vlm" if lk in vlm_fields else "classifier"
+            st.markdown(_card(lk, info["value"], info.get("confidence"),
+                              source=src), unsafe_allow_html=True)
+
+    pc = result.get("product_class")
+    if pc:
+        src = "vlm" if "product_class" in vlm_fields else "classifier"
+        st.markdown(_card("Product Class", pc["value"], pc.get("confidence"),
+                          source=src), unsafe_allow_html=True)
+
+    st.markdown("##### Attributes")
+    cols = st.columns(3)
+    for i, attr in enumerate(ATTR_ORDER):
+        info = result.get("attributes", {}).get(attr)
+        if not info:
+            continue
+        with cols[i % 3]:
+            src = result.get("field_sources", {}).get(attr, "classifier")
+            val = info.get("value", "?")
+            st.markdown(_card(attr.replace("_", " ").title(), val,
+                              info.get("confidence"), source=src),
+                        unsafe_allow_html=True)
+
+    n_cls = sum(1 for v in result.get("field_sources", {}).values() if v == "classifier")
+    n_vlm = sum(1 for v in result.get("field_sources", {}).values() if v == "vlm")
+    if vlm_ms > 0:
+        st.success(f"⚡ {n_cls} fields from classifier ({cls_ms:.0f}ms) + "
+                   f"🔄 {n_vlm} fields from VLM ({vlm_ms:.0f}ms)")
+    else:
+        st.success(f"⚡ All {n_cls} fields from classifier ({cls_ms:.0f}ms) — no VLM needed!")
+
+    with st.expander("Raw JSON"):
+        st.json(result)
 
 def show_search_results(results, query=""):
     if not results:
         st.warning("No results found")
         return
     for r in results:
-        pid = r.get("product_id", "")
         name = r.get("product_name", "Unknown")
         score = r.get("boosted_score", r.get("ce_score", r.get("score", 0)))
         rank = r.get("final_rank", r.get("rank", ""))
         with st.container():
-            col_rank, col_info, col_score = st.columns([1, 6, 2])
-            with col_rank:
+            c1, c2, c3 = st.columns([1, 6, 2])
+            with c1:
                 st.markdown(f"### #{rank}")
-            with col_info:
+            with c2:
                 st.markdown(f"**{name}**")
-                st.caption(f"ID: {pid}")
-                matches = r.get("product_attributes", {})
-                query_attrs = r.get("query_attributes", {})
-                if matches and query_attrs:
-                    tags = []
-                    for key in ["color_family", "style", "primary_material", "product_type"]:
-                        qv = query_attrs.get(key, "")
-                        pv = str(matches.get(key, "") or "").lower()
-                        if qv and pv:
-                            if qv.lower() in pv:
-                                tags.append(f":green[{key}: {pv}]")
-                            else:
-                                tags.append(f":red[{key}: {pv}]")
-                    if tags:
-                        st.markdown(" | ".join(tags))
-            with col_score:
+                st.caption(f"ID: {r.get('product_id', '')}")
+            with c3:
                 st.metric("Score", f"{score:.3f}")
             st.divider()
 
-# ── Main ──
+# ================================================================
+# MAIN
+# ================================================================
 
 def main():
-    st.set_page_config(page_title="Product Intelligence System", page_icon="\U0001F3E0", layout="wide")
-    st.title("\U0001F3E0 Product Intelligence System")
-    st.markdown("**End-to-end Product Intelligence: Attribute Extraction + Search Relevance**")
+    st.set_page_config(page_title="Wayfair Product Intelligence",
+                       page_icon="🏠", layout="wide")
+    st.title("🏠 Wayfair Product Intelligence")
+    st.markdown("**Multi-Tower Classifier · VLM Fallback · Search Relevance**")
 
-    tab1, tab2 = st.tabs(["\U0001F50D Catatlog Attribute Extraction", "\U0001F50E Product Search"])
+    tab1, tab2 = st.tabs(["🔍 Attribute Extraction", "🔎 Product Search"])
 
-    # === TAB 1: EXTRACTION ===
+    # ── TAB 1: EXTRACTION ──
     with tab1:
-        st.markdown("Upload a photo and/or enter a description to extract structured attributes.")
-        st.sidebar.header("Settings")
-        available = {}
-        for name, cfg in EXTRACTION_MODELS.items():
-            if cfg["path"] is None or Path(cfg["path"]).exists():
-                available[name] = cfg
+        st.sidebar.header("⚙️ Settings")
+        mode = st.sidebar.radio(
+            "Extraction Mode",
+            ["🔄 VLM Only (LLaVA)",
+             "⚡ Classifier Only",
+             "⚡+🔄 Classifier + VLM Fallback"],
+            index=2)
+
+        adapter_path = None
+        if "VLM" in mode or "Fallback" in mode:
+            available = {k: v for k, v in LLAVA_ADAPTERS.items() if Path(v).exists()}
+            if available:
+                sel = st.sidebar.selectbox("LLaVA Adapter", list(available.keys()))
+                adapter_path = available[sel]
             else:
-                available[name + " [not trained]"] = {**cfg, "disabled": True}
-        selected = st.sidebar.selectbox("Extraction model", list(available.keys()), key="ext_model")
-        model_cfg = available[selected]
-        if model_cfg.get("disabled"):
-            st.sidebar.error("Model not trained yet")
+                st.sidebar.warning("No LLaVA adapters found")
+
+        confidence_threshold = 0.5
+        if "Classifier" in mode:
+            confidence_threshold = st.sidebar.slider(
+                "Confidence Threshold", 0.1, 0.9, 0.5, 0.05)
+            cls_model, _, cls_meta = load_classifier()
+            if cls_model is None:
+                st.sidebar.error("Classifier not found")
+            else:
+                st.sidebar.success(f"Classifier loaded (epoch {cls_meta['epoch']})")
+
         st.sidebar.markdown("---")
-        st.sidebar.markdown("**Cost per 1K:**\n- Rule-based: ~$0\n- LLaVA: ~$0.20\n- GPT-4o: ~$10")
-        compare = st.sidebar.checkbox("Compare two models", key="ext_cmp")
-        compare_model = None
-        if compare:
-            others = [n for n in available if n != selected and not available[n].get("disabled")]
-            if others:
-                compare_model = st.sidebar.selectbox("Compare with", others, key="ext_cmp2")
+        st.sidebar.markdown("**Latency:**\n- ⚡ Classifier: ~50ms\n- 🔄 VLM: ~2-5s\n"
+                            "- ⚡+🔄 Hybrid: 50ms + VLM for low-conf")
 
-        col1, col2 = st.columns(2)
-        with col1:
-            st.subheader("Input")
-            uploaded_image = None
-            if model_cfg["type"] in ("llava", "hybrid", "gpt4o") and not model_cfg.get("disabled"):
-                uploaded_image = st.file_uploader("Product Image (optional)", type=["jpg", "jpeg", "png"])
-                if uploaded_image:
-                    st.image(uploaded_image, caption="Product image", use_container_width=True)
-            product_name = st.text_input("Product Name", value="Modern Walnut Wood Dining Table with Metal Legs")
+        col_in, col_out = st.columns([1, 1])
+        with col_in:
+            st.subheader("📦 Product Input")
+            uploaded_image = st.file_uploader(
+                "Product Image", type=["jpg", "jpeg", "png", "webp"])
+            if uploaded_image:
+                st.image(uploaded_image, use_container_width=True)
+            product_name = st.text_input(
+                "Product Name", value="Modern Walnut Wood Dining Table with Metal Legs")
             product_class = st.text_input("Category", value="Dining Tables")
-            product_description = st.text_area(
+            product_desc = st.text_area(
                 "Description",
-                value="Solid walnut table, black metal hairpin legs. Assembly required.",
-                height=80)
-            extract_btn = st.button("Extract Attributes", type="primary", use_container_width=True)
+                value="Solid walnut table top with sleek black metal hairpin legs. "
+                      "Mid-century modern style. Assembly required.",
+                height=100)
+            btn = st.button("🚀 Extract Attributes", type="primary",
+                            use_container_width=True)
 
-        with col2:
-            st.subheader("Results")
-            if extract_btn and not model_cfg.get("disabled"):
-                results = {}
-                with st.spinner(f"Running {selected}..."):
-                    t0 = time.time()
-                    results[selected] = _run_extraction(
-                        model_cfg, product_name, product_description, product_class, uploaded_image)
-                    st.caption(f"Latency: {(time.time()-t0)*1000:.0f}ms")
-                if compare_model:
-                    with st.spinner(f"Running {compare_model}..."):
-                        results[compare_model] = _run_extraction(
-                            available[compare_model], product_name, product_description,
-                            product_class, uploaded_image)
-                if compare_model:
-                    import pandas as pd
-                    models = list(results.keys())
-                    all_attrs = sorted(set(k for r in results.values() for k in r.keys()))
-                    rows = []
-                    for a in all_attrs:
-                        row = {"Attribute": a.replace("_", " ").title()}
-                        for m in models:
-                            label = m.split("(")[0].strip()
-                            val = results[m].get(a)
-                            row[label] = "\u2014" if val is None else str(val).title()
-                        rows.append(row)
-                    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-                else:
-                    show_extraction_result(results[selected])
+        with col_out:
+            st.subheader("📊 Results")
+            if btn:
+                if uploaded_image:
+                    uploaded_image.seek(0)
 
-    # === TAB 2: SEARCH ===
+                if "VLM Only" in mode:
+                    if adapter_path is None:
+                        st.error("No LLaVA adapter")
+                    else:
+                        with st.spinner("🔄 Running LLaVA..."):
+                            t0 = time.time()
+                            result, raw = extract_vlm(
+                                product_name, product_desc, product_class,
+                                uploaded_image, adapter_path)
+                            ms = (time.time() - t0) * 1000
+                        st.caption(f"🔄 {ms:.0f}ms")
+                        show_vlm_result(result, raw)
+
+                elif "Classifier Only" in mode:
+                    cls_model, _, _ = load_classifier()
+                    if cls_model is None:
+                        st.error("Classifier not loaded")
+                    else:
+                        with st.spinner("⚡ Running classifier..."):
+                            result, _ = extract_classifier(
+                                product_name, product_desc, product_class,
+                                uploaded_image, confidence_threshold)
+                        show_classifier_result(result)
+
+                elif "Fallback" in mode:
+                    cls_model, _, _ = load_classifier()
+                    if cls_model is None:
+                        st.error("Classifier not loaded")
+                    elif adapter_path is None:
+                        st.warning("No VLM — running classifier only")
+                        with st.spinner("⚡ Running classifier..."):
+                            result, _ = extract_classifier(
+                                product_name, product_desc, product_class,
+                                uploaded_image, confidence_threshold)
+                        show_classifier_result(result)
+                    else:
+                        with st.spinner("⚡ Classifier → 🔄 VLM fallback..."):
+                            result = extract_hybrid(
+                                product_name, product_desc, product_class,
+                                uploaded_image, adapter_path,
+                                confidence_threshold)
+                        show_hybrid_result(result)
+
+    # ── TAB 2: SEARCH ──
     with tab2:
-        st.markdown("**Bi-encoder retrieval \u2192 Cross-encoder reranking \u2192 Attribute-boosted scoring**")
+        st.markdown("**Bi-encoder → Cross-encoder → Attribute-boosted scoring**")
         pipeline = load_search_pipeline()
         bm25 = load_bm25()
         if pipeline is None and bm25 is None:
-            st.warning(
-                "Search not available yet. Run:\n\n"
-                "`python scripts/prepare_search_data.py && "
-                "python scripts/enrich_catalog.py && "
-                "python scripts/train_search.py`")
+            st.warning("Search not available. Run training scripts first.")
             return
-        st.sidebar.header("Search Settings")
+
+        st.sidebar.header("🔎 Search")
         search_mode = st.sidebar.selectbox(
-            "Approach",
-            ["Full Pipeline", "Bi-Encoder + Cross-Encoder", "Bi-Encoder Only", "BM25 Baseline"],
-            key="s_mode")
+            "Approach", ["Full Pipeline", "Bi-Encoder + Cross-Encoder",
+                         "Bi-Encoder Only", "BM25 Baseline"], key="s_mode")
         top_k = st.sidebar.slider("Results", 5, 20, 10, key="topk")
-        show_comparison = st.sidebar.checkbox("Compare all approaches", key="s_cmp")
 
-        query = st.text_input(
-            "Search query", value="modern blue velvet sofa", key="sq",
-            placeholder="Try: rustic wooden dining table, industrial bookshelf...")
+        if "search_query" not in st.session_state:
+            st.session_state.search_query = "modern blue velvet sofa"
+        if "run_search" not in st.session_state:
+            st.session_state.run_search = False
+
+        def set_q(q):
+            st.session_state.search_query = q
+            st.session_state.run_search = True
+        def on_enter():
+            st.session_state.run_search = True
+
+        query = st.text_input("Search", key="search_query",
+                              placeholder="rustic wooden dining table...",
+                              on_change=on_enter)
         ex_cols = st.columns(6)
-        examples = [
-            "blue modern sofa", "rustic dining table", "metal bookshelf",
-            "velvet accent chair", "marble coffee table", "outdoor patio set"]
-        for col, ex in zip(ex_cols, examples):
+        for col, ex in zip(ex_cols, ["blue modern sofa", "rustic dining table",
+                "metal bookshelf", "velvet accent chair",
+                "marble coffee table", "outdoor patio set"]):
             with col:
-                if st.button(ex, key=f"ex_{ex}", use_container_width=True):
-                    query = ex
+                st.button(ex, key=f"ex_{ex}", use_container_width=True,
+                          on_click=set_q, args=(ex,))
 
-        search_btn = st.button(
-            "\U0001F50E Search", type="primary", use_container_width=True, key="sbtn")
+        go = st.button("🔎 Search", type="primary", use_container_width=True, key="sbtn")
+        should = go or st.session_state.run_search
+        st.session_state.run_search = False
+        query = st.session_state.search_query
 
-        if search_btn and query:
-            if show_comparison and pipeline:
-                st.subheader("Approach Comparison")
-                comparisons = {}
-                if bm25:
-                    t0 = time.time()
-                    comparisons["BM25"] = (bm25.search(query, top_k), (time.time()-t0)*1000)
-                if pipeline:
-                    for sname, stages in [
-                        ("Bi-Encoder", ["bi_encoder"]),
-                        ("+ Cross-Encoder", ["bi_encoder", "cross_encoder"]),
-                        ("+ Attr Boost", ["bi_encoder", "cross_encoder", "attribute_boost"]),
-                    ]:
-                        t0 = time.time()
-                        comparisons[sname] = (
-                            pipeline.search(query, top_k, stages=stages),
-                            (time.time()-t0)*1000)
-                cols = st.columns(len(comparisons))
-                for col, (cname, (res, lat)) in zip(cols, comparisons.items()):
-                    with col:
-                        st.markdown(f"**{cname}** ({lat:.0f}ms)")
-                        for r in res[:5]:
-                            s = r.get("boosted_score", r.get("ce_score", r.get("score", 0)))
-                            st.markdown(f"- {r.get('product_name', '')[:40]}")
-                            st.caption(f"  Score: {s:.3f}")
-            else:
-                with st.spinner("Searching..."):
-                    t0 = time.time()
-                    if search_mode == "BM25 Baseline" and bm25:
-                        results = bm25.search(query, top_k)
-                    elif pipeline:
-                        stage_map = {
-                            "Full Pipeline": ["bi_encoder", "cross_encoder", "attribute_boost"],
-                            "Bi-Encoder + Cross-Encoder": ["bi_encoder", "cross_encoder"],
-                            "Bi-Encoder Only": ["bi_encoder"],
-                        }
-                        stages = stage_map.get(search_mode, ["bi_encoder"])
-                        results = pipeline.search(query, top_k, stages=stages)
-                    else:
-                        results = []
-                    latency = (time.time()-t0)*1000
-                st.caption(f"{len(results)} results in {latency:.0f}ms | {search_mode}")
-                if pipeline and pipeline.attribute_booster:
-                    qa = pipeline.attribute_booster.parse_query_attributes(query)
-                    if qa:
-                        st.info("Detected: " + " | ".join(
-                            f"**{k}**: {v}" for k, v in qa.items()))
-                show_search_results(results, query)
-
+        if should and query:
+            with st.spinner("Searching..."):
+                t0 = time.time()
+                if search_mode == "BM25 Baseline" and bm25:
+                    results = bm25.search(query, top_k)
+                elif pipeline:
+                    stage_map = {"Full Pipeline": ["bi_encoder","cross_encoder","attribute_boost"],
+                                 "Bi-Encoder + Cross-Encoder": ["bi_encoder","cross_encoder"],
+                                 "Bi-Encoder Only": ["bi_encoder"]}
+                    results = pipeline.search(query, top_k,
+                                              stages=stage_map.get(search_mode, ["bi_encoder"]))
+                else:
+                    results = []
+                lat = (time.time()-t0)*1000
+            st.caption(f"{len(results)} results in {lat:.0f}ms")
+            show_search_results(results, query)
 
 if __name__ == "__main__":
     main()
