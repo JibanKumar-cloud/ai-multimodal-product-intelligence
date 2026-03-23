@@ -83,3 +83,13 @@ Thumbs.db
 # Misc
 *.npy
 *.npz
+
+# Large data files (not in git)
+data/images/
+data/processed/classifier_products.tsv
+data/processed/image_queue*.json
+data/processed/claude_progress.json
+data/processed/rule_baseline.json
+data/processed/data_summary.json
+checkpoints/
+*.pt

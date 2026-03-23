@@ -212,18 +212,18 @@ class ProductClassifierDataset(Dataset):
         # Text level probabilities
         # OLD: 70% heavily degraded → gate learns "text = garbage, use image"
         # NEW: 40% degraded → gate can learn text is useful for assembly/style
-        text_full_prob=0.35,
-        text_partial_prob=0.25,
-        text_name_prob=0.20,
+        text_full_prob=0.50,
+        text_partial_prob=0.20,
+        text_name_prob=0.15,
         text_minimal_prob=0.10,
-        text_empty_prob=0.10,
+        text_empty_prob=0.05,
         # Per-attribute mask probabilities
         # With ConcatHead (no gate), heavy masking destroys useful signal.
         # Light masking for regularization only.
-        color_mask_prob=0.10,
+        color_mask_prob=0.05,
         shape_mask_prob=0.0,       # shape is image-only, no text to mask
-        style_mask_prob=0.10,
-        material_mask_prob=0.10,
+        style_mask_prob=0.05,
+        material_mask_prob=0.05,
         # assembly_mask_prob = 0.0 (NEVER)
     ):
         super().__init__()

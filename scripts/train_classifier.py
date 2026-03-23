@@ -29,6 +29,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
+import json as _json
 
 from src.classifier.dataset import build_dataloaders
 from src.classifier.attribute_head import AttributePredictor
@@ -330,6 +331,12 @@ def main():
         taxonomy_path=args.taxonomy,
         vocab_path=args.vocab,
     ).to(device)
+
+    # Class-weighted loss for label imbalance
+    # with open(args.queue) as _f:
+    #     _queue = _json.load(_f)
+    # model.attribute_heads.compute_class_weights(_queue)
+    # model.taxonomy_heads.compute_class_weights(_queue)
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
