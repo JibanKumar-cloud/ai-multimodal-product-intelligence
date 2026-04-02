@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Product Intelligence</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0c0f14;font-family:'DM Sans',sans-serif;color:#e2e8f0}
+@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+@keyframes spin{to{transform:rotate(360deg)}}
+.spin{display:inline-block;width:16px;height:16px;border:2px solid rgba(129,140,248,.3);border-top-color:#818cf8;border-radius:50%;animation:spin .6s linear infinite}
+.spin-w{border-color:rgba(255,255,255,.3);border-top-color:#fff}
+select:focus,input:focus,textarea:focus{outline:none;border-color:#6366f1!important;box-shadow:0 0 0 2px rgba(99,102,241,.15)}
+::-webkit-scrollbar{width:6px}::-webkit-scrollbar-track{background:#111419}::-webkit-scrollbar-thumb{background:#2d3348;border-radius:3px}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const {useState,useEffect,useRef} = React;
+
+const ATTR_ORDER = ["primary_color","secondary_color","primary_material","secondary_material","style","shape","assembly"];
+const LABELS = {primary_color:"Primary Color",secondary_color:"Secondary Color",primary_material:"Primary Material",secondary_material:"Secondary Material",style:"Style",shape:"Shape",assembly:"Assembly"};
+const MODES = [{key:"classifier",label:"Classifier",icon:"⚡",desc:"~50ms"},{key:"hybrid",label:"Hybrid",icon:"⚡+🔄",desc:"50ms+VLM"},{key:"vlm",label:"VLM Only",icon:"🔄",desc:"~2-5s"}];
+const DEFAULT_VOCAB = {primary_color:["beige","black","blue","brown","burgundy","clear","cream","dark_brown","dark_gray","gold","gold_metal","green","gray","light_blue","light_brown","light_gray","multi","natural","navy","orange","pink","purple","red","rust","sage","silver","teal","white","yellow"],secondary_color:["beige","black","blue","brown","burgundy","clear","cream","dark_brown","dark_gray","gold","gold_metal","green","gray","light_blue","light_brown","light_gray","multi","natural","navy","orange","pink","purple","red","rust","sage","silver","teal","white","yellow"],primary_material:["brass_metal","ceramic","dark_wood","faux_leather","foam","glass","iron","leather","light_wood","linen","manufactured_wood","metal","microfiber","natural_fiber","plastic","stone","synthetics","velvet","wood"],secondary_material:["brass_metal","ceramic","dark_wood","faux_leather","foam","glass","iron","leather","light_wood","linen","manufactured_wood","metal","microfiber","natural_fiber","plastic","stone","synthetics","velvet","wood"],style:["bohemian","coastal","farmhouse","industrial","mid-century modern","modern","rustic","traditional"],shape:["hexagon","irregular","l-shaped","oval","rectangular","round","runner","square","u-shaped"],assembly:["full","none","partial"]};
+const fmt = s => s ? s.replace(/_/g," ").replace(/\b\w/g,c=>c.toUpperCase()) : "—";
+
+function Badge({conf,source}) {
+  if(conf==="HV") return <span style={{color:"#34d399",fontWeight:600,fontSize:11,padding:"2px 8px",background:"rgba(52,211,153,.1)",borderRadius:4}}>✓ Human</span>;
+  if(conf==null) return source==="vlm" ? <span style={{color:"#a78bfa",fontWeight:600,fontSize:11,padding:"2px 8px",background:"rgba(167,139,250,.1)",borderRadius:4}}>VLM</span> : <span style={{color:"#475569"}}>—</span>;
+  const pct = Math.round(conf*100)+"%";
+  if(conf>=.7) return <span style={{color:"#34d399",fontWeight:600,fontSize:12,fontFamily:"'JetBrains Mono',monospace"}}>{pct}</span>;
+  if(conf>=.4) return <span style={{color:"#fbbf24",fontWeight:600,fontSize:12,fontFamily:"'JetBrains Mono',monospace"}}>{pct}</span>;
+  return <span style={{color:"#f87171",fontWeight:600,fontSize:12,fontFamily:"'JetBrains Mono',monospace"}}>{pct}</span>;
+}
+
+function fileToB64(file) {
+  return new Promise(r => { const rd=new FileReader(); rd.onload=()=>r(rd.result.split(",")[1]); rd.readAsDataURL(file); });
+}
+
+// ── TAXONOMY TABLE ──
+function TaxTable({tax}) {
+  const levels = Object.entries(tax||{}).sort(([a],[b])=>a.localeCompare(b));
+  if(!levels.length) return null;
+  return <div style={{borderRadius:10,overflow:"hidden",border:"1px solid #1e2330",marginBottom:12}}>
+    <table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
+      <thead><tr>
+        <th style={TH}>Level</th><th style={TH}>Category</th><th style={{...TH,textAlign:"right",width:80}}>Conf.</th>
+      </tr></thead>
+      <tbody>{levels.map(([lk,info],i) =>
+        <tr key={lk} style={{background:i%2===0?"#14181f":"#111419"}}>
+          <td style={{...TD,color:"#64748b",fontFamily:"'JetBrains Mono',monospace",fontSize:11,width:50}}>{lk.replace("level_","L")}</td>
+          <td style={{...TD,fontWeight:600}}>{fmt(info.value)}</td>
+          <td style={{...TD,textAlign:"right"}}><Badge conf={info.confidence}/></td>
+        </tr>
+      )}</tbody>
+    </table>
+  </div>;
+}
+
+// ── PRODUCT CLASS ──
+function PCCard({pc}) {
+  if(!pc?.value) return null;
+  return <div style={{background:"#14181f",border:"1px solid #1e2330",borderRadius:10,padding:"12px 16px",marginBottom:12}}>
+    <div style={{fontSize:10,fontWeight:600,color:"#64748b",textTransform:"uppercase",letterSpacing:".8px",marginBottom:6}}>Product Class</div>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+      <span style={{fontSize:15,fontWeight:600,color:"#f1f5f9"}}>{fmt(pc.value)}</span>
+      <Badge conf={pc.confidence}/>
+    </div>
+  </div>;
+}
+
+// ── ATTRIBUTES TABLE ──
+function AttrTable({attrs,sources,vocab,edited,onEdit,vlmAttrs,vlmLoading}) {
+  const visible = ATTR_ORDER.filter(a => attrs?.[a]?.value);
+  if(!visible.length) return null;
+  return <div style={{borderRadius:10,overflow:"hidden",border:"1px solid #1e2330",marginBottom:12}}>
+    <table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
+      <thead><tr>
+        <th style={TH}>Attribute</th><th style={TH}>Value</th><th style={{...TH,textAlign:"right",width:80}}>Conf.</th>
+      </tr></thead>
+      <tbody>{visible.map((attr,i) => {
+        const info = attrs[attr];
+        const orig = (info.value||"").toLowerCase().replace(/ /g,"_");
+        const cur = edited[attr] || orig;
+        const isLoading = vlmLoading && (vlmAttrs||[]).includes(attr);
+        const isEdited = edited[attr] && edited[attr] !== orig;
+        const opts = vocab[attr] || [];
+        const allOpts = opts.includes(orig) ? opts : [orig,...opts];
+        const src = sources?.[attr];
+        return <tr key={attr} style={{background:i%2===0?"#14181f":"#111419"}}>
+          <td style={{...TD,color:"#cbd5e1",fontWeight:500}}>{LABELS[attr]}</td>
+          <td style={TD}>{isLoading
+            ? <span style={{color:"#64748b"}}>{fmt(orig)} <span className="spin" style={{marginLeft:6,width:14,height:14}}/></span>
+            : <select value={cur} onChange={e=>onEdit(attr,e.target.value)} style={{width:"100%",background:"#0c0f14",border:"1px solid #2d3348",borderRadius:6,padding:"5px 8px",color:"#e2e8f0",fontSize:13,fontFamily:"'DM Sans',sans-serif",cursor:"pointer"}}>
+                {allOpts.map(o => <option key={o} value={o}>{fmt(o)}</option>)}
+              </select>
+          }</td>
+          <td style={{...TD,textAlign:"right"}}>{isLoading
+            ? <span style={{color:"#a78bfa",fontWeight:600,fontSize:11}}>⏳</span>
+            : isEdited ? <span style={{color:"#34d399",fontWeight:600,fontSize:11,padding:"2px 8px",background:"rgba(52,211,153,.1)",borderRadius:4}}>✓ HV</span>
+            : <Badge conf={info.confidence} source={src}/>
+          }</td>
+        </tr>;
+      })}</tbody>
+    </table>
+    {vlmLoading && vlmAttrs?.length>0 && <div style={{padding:"10px 14px",background:"rgba(129,140,248,.08)",borderTop:"1px solid rgba(129,140,248,.15)",fontSize:12,color:"#a5b4fc",display:"flex",alignItems:"center",gap:8}}>
+      <span className="spin" style={{width:14,height:14}}/> Running VLM for: {vlmAttrs.map(a=>fmt(a)).join(", ")}
+    </div>}
+  </div>;
+}
+
+const TH = {background:"#1a2035",color:"#94a3b8",padding:"10px 14px",textAlign:"left",fontWeight:600,fontSize:11,textTransform:"uppercase",letterSpacing:".6px",borderBottom:"1px solid #1e2330"};
+const TD = {padding:"9px 14px",borderBottom:"1px solid #1a1e28",color:"#e2e8f0",fontSize:13};
+
+// ── MAIN APP ──
+function App() {
+  const [mode,setMode] = useState("classifier");
+  const [loading,setLoading] = useState(false);
+  const [step,setStep] = useState("");
+  const [result,setResult] = useState(null);
+  const [edited,setEdited] = useState({});
+  const [vocab,setVocab] = useState(DEFAULT_VOCAB);
+  const [imgFile,setImgFile] = useState(null);
+  const [imgUrl,setImgUrl] = useState(null);
+  const [form,setForm] = useState({product_name:"Modern Walnut Wood Dining Table with Metal Legs",product_class:"Dining Tables",description:"Solid walnut table top with sleek black metal hairpin legs. Mid-century modern style. Assembly required.",confidence_threshold:.5});
+  const fileRef = useRef();
+
+  useEffect(()=>{ fetch("/config").then(r=>r.json()).then(d=>{if(d.vocab)setVocab(d.vocab)}).catch(()=>{}) },[]);
+
+  const onImage = e => { const f=e.target.files?.[0]; if(!f)return; setImgFile(f); setImgUrl(URL.createObjectURL(f)); };
+  const onDrop = e => { e.preventDefault(); const f=e.dataTransfer.files?.[0]; if(f?.type.startsWith("image/")){setImgFile(f);setImgUrl(URL.createObjectURL(f));} };
+
+  const predict = async () => {
+    setLoading(true); setResult(null); setEdited({}); setStep(mode);
+    const payload = {...form};
+    if(imgFile) payload.image_base64 = await fileToB64(imgFile);
+    try {
+      if(mode==="hybrid") {
+        setStep("classifier");
+        const res = await fetch("/predict/hybrid/stream",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
+        const reader = res.body.getReader();
+        const dec = new TextDecoder();
+        let buf = "";
+        while(true) {
+          const {done,value} = await reader.read();
+          if(done) break;
+          buf += dec.decode(value,{stream:true});
+          const lines = buf.split("\n"); buf = lines.pop()||"";
+          for(const line of lines) {
+            if(line.startsWith("data: ")) {
+              const d = line.slice(6);
+              if(d==="[DONE]") break;
+              try { const p=JSON.parse(d); setResult(p); if(p.step==="classifier") setStep("vlm"); else setStep(""); } catch{}
+            }
+          }
+        }
+      } else {
+        const ep = mode==="vlm"?"vlm":"classifier";
+        const res = await fetch(`/predict/${ep}`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
+        setResult(await res.json());
+      }
+    } catch(e) { setResult({error:e.message}); }
+    setLoading(false); setStep("");
+  };
+
+  const exportJSON = () => {
+    if(!result) return {};
+    const out = {};
+    Object.entries(result.taxonomy||{}).sort(([a],[b])=>a.localeCompare(b)).forEach(([k,v])=>{out[k]=v?.value});
+    if(result.product_class?.value) out.product_class = result.product_class.value;
+    ATTR_ORDER.forEach(a => {
+      if(edited[a]) out[a] = {value:edited[a],confidence:"HV"};
+      else if(result.attributes?.[a]?.value) out[a] = result.attributes[a];
+    });
+    return out;
+  };
+
+  return <div style={{minHeight:"100vh"}}>
+    {/* HEADER */}
+    <header style={{borderBottom:"1px solid #1e2330",background:"linear-gradient(180deg,#10141c,#0c0f14)",padding:"20px 0"}}>
+      <div style={{maxWidth:1280,margin:"0 auto",padding:"0 32px",display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:16}}>
+        <div>
+          <h1 style={{fontSize:22,fontWeight:700,color:"#f1f5f9",letterSpacing:"-.5px"}}><span style={{color:"#818cf8",marginRight:10}}>◆</span>Product Intelligence</h1>
+          <p style={{fontSize:11,color:"#64748b",marginTop:4,letterSpacing:".5px",textTransform:"uppercase"}}>Multi-Tower Classifier · VLM Fallback · Search Relevance</p>
+        </div>
+        <div style={{display:"flex",gap:4,background:"#111419",borderRadius:10,padding:4,border:"1px solid #1e2330"}}>
+          {MODES.map(m => <button key={m.key} onClick={()=>setMode(m.key)} style={{background:mode===m.key?"#1e293b":"transparent",border:"none",borderRadius:8,padding:"8px 16px",cursor:"pointer",color:mode===m.key?"#f1f5f9":"#94a3b8",display:"flex",flexDirection:"column",alignItems:"center",gap:2,transition:"all .2s",minWidth:85,boxShadow:mode===m.key?"0 2px 8px rgba(0,0,0,.3)":"none"}}>
+            <span style={{fontSize:13}}>{m.icon}</span>
+            <span style={{fontSize:12,fontWeight:600}}>{m.label}</span>
+            <span style={{fontSize:10,opacity:.6}}>{m.desc}</span>
+          </button>)}
+        </div>
+      </div>
+    </header>
+
+    {/* MAIN */}
+    <main style={{maxWidth:1280,margin:"0 auto",padding:"24px 32px"}}>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1.2fr",gap:28,alignItems:"start"}}>
+
+        {/* INPUT */}
+        <section style={{background:"#111419",borderRadius:14,padding:24,border:"1px solid #1e2330"}}>
+          <h2 style={{fontSize:15,fontWeight:600,color:"#f1f5f9",marginBottom:20}}>📦 Product Input</h2>
+          <div onClick={()=>fileRef.current?.click()} onDrop={onDrop} onDragOver={e=>e.preventDefault()} style={{border:imgUrl?"2px solid #2d3348":"2px dashed #2d3348",borderRadius:12,textAlign:"center",cursor:"pointer",marginBottom:16,background:"#0c0f14",overflow:"hidden",minHeight:120,display:"flex",alignItems:"center",justifyContent:"center"}}>
+            {imgUrl ? <img src={imgUrl} style={{width:"100%",maxHeight:260,objectFit:"cover"}}/> : <div style={{padding:24}}><div style={{fontSize:28,marginBottom:4}}>🖼</div><div style={{color:"#94a3b8",fontSize:13}}>Drop image or click</div><div style={{color:"#475569",fontSize:11,marginTop:4}}>JPG, PNG, WebP</div></div>}
+            <input ref={fileRef} type="file" accept="image/*" onChange={onImage} style={{display:"none"}}/>
+          </div>
+          <div style={{marginBottom:14}}>
+            <label style={LBL}>Product Name</label>
+            <input style={INP} value={form.product_name} onChange={e=>setForm(f=>({...f,product_name:e.target.value}))} placeholder="e.g. Modern Walnut Dining Table"/>
+          </div>
+          <div style={{marginBottom:14}}>
+            <label style={LBL}>Category</label>
+            <input style={INP} value={form.product_class} onChange={e=>setForm(f=>({...f,product_class:e.target.value}))} placeholder="e.g. Dining Tables"/>
+          </div>
+          <div style={{marginBottom:14}}>
+            <label style={LBL}>Description</label>
+            <textarea style={{...INP,resize:"vertical",minHeight:60}} value={form.description} onChange={e=>setForm(f=>({...f,description:e.target.value}))} placeholder="Product description..."/>
+          </div>
+          {mode!=="vlm" && <div style={{marginBottom:14}}>
+            <label style={LBL}>Threshold: {form.confidence_threshold}</label>
+            <input type="range" min=".1" max=".9" step=".05" value={form.confidence_threshold} onChange={e=>setForm(f=>({...f,confidence_threshold:+e.target.value}))} style={{width:"100%",accentColor:"#818cf8"}}/>
+          </div>}
+          <button onClick={predict} disabled={loading} style={{width:"100%",background:"linear-gradient(135deg,#6366f1,#818cf8)",color:"#fff",border:"none",borderRadius:10,padding:"13px 0",fontSize:14,fontWeight:600,cursor:loading?"wait":"pointer",opacity:loading?.7:1,fontFamily:"'DM Sans',sans-serif",letterSpacing:".3px",marginTop:4,transition:"opacity .2s"}}>
+            {loading ? <span style={{display:"flex",alignItems:"center",justifyContent:"center",gap:8}}><span className="spin spin-w"/> {step==="classifier"?"Running Classifier...":step==="vlm"?"Running VLM...":"Processing..."}</span> : "Extract Attributes"}
+          </button>
+        </section>
+
+        {/* RESULTS */}
+        <section style={{background:"#111419",borderRadius:14,padding:24,border:"1px solid #1e2330",minHeight:400}}>
+          <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:20}}>
+            <h2 style={{fontSize:15,fontWeight:600,color:"#f1f5f9",flex:1}}>📊 Results</h2>
+            {result?.latency_ms && <span style={{fontSize:11,color:"#94a3b8",background:"#1e293b",padding:"4px 10px",borderRadius:20,fontFamily:"'JetBrains Mono',monospace"}}>
+              ⚡{result.latency_ms}ms{result.vlm_ms ? ` + 🔄${result.vlm_ms}ms`:""}
+            </span>}
+          </div>
+
+          {!result && !loading && <div style={{display:"flex",flexDirection:"column",alignItems:"center",padding:"60px 0",gap:12}}>
+            <span style={{fontSize:36,color:"#2d3348"}}>◇</span>
+            <p style={{color:"#475569",fontSize:14}}>Upload a product and click Extract</p>
+          </div>}
+
+          {loading && !result && <div style={{display:"flex",flexDirection:"column",alignItems:"center",padding:"60px 0",gap:12}}>
+            <span className="spin" style={{width:28,height:28}}/>
+            <p style={{color:"#475569",fontSize:14}}>Analyzing product...</p>
+          </div>}
+
+          {result?.error && <div style={{background:"#1c1012",border:"1px solid #5c1d1d",color:"#fca5a5",borderRadius:10,padding:"12px 16px",fontSize:13}}>{result.error}</div>}
+
+          {result && !result.error && <div style={{animation:"fadeIn .4s ease"}}>
+            <TaxTable tax={result.taxonomy}/>
+            <PCCard pc={result.product_class}/>
+            <AttrTable attrs={result.attributes||{}} sources={result.sources||{}} vocab={vocab} edited={edited} onEdit={(a,v)=>setEdited(p=>({...p,[a]:v}))} vlmAttrs={result.vlm_attrs||[]} vlmLoading={step==="vlm"}/>
+            {result.mode==="hybrid" && !loading && <div style={{background:"rgba(52,211,153,.08)",border:"1px solid rgba(52,211,153,.15)",borderRadius:8,padding:"10px 14px",fontSize:12,color:"#6ee7b7",fontFamily:"'JetBrains Mono',monospace",marginBottom:12}}>
+              ⚡ Classifier ({result.cls_ms?.toFixed(0)}ms) + 🔄 VLM ({result.vlm_ms?.toFixed(0)}ms)
+            </div>}
+            <details style={{marginTop:8}}>
+              <summary style={{fontSize:12,color:"#64748b",cursor:"pointer",padding:"8px 0",fontWeight:500}}>Export JSON</summary>
+              <pre style={{background:"#0c0f14",border:"1px solid #1e2330",borderRadius:8,padding:14,fontSize:11,color:"#94a3b8",overflow:"auto",maxHeight:300,fontFamily:"'JetBrains Mono',monospace"}}>{JSON.stringify(exportJSON(),null,2)}</pre>
+            </details>
+          </div>}
+        </section>
+      </div>
+    </main>
+  </div>;
+}
+
+const LBL = {display:"block",fontSize:11,fontWeight:600,color:"#94a3b8",textTransform:"uppercase",letterSpacing:".5px",marginBottom:6};
+const INP = {width:"100%",background:"#0c0f14",border:"1px solid #2d3348",borderRadius:8,padding:"10px 14px",color:"#e2e8f0",fontSize:14,fontFamily:"'DM Sans',sans-serif",transition:"border-color .2s"};
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>

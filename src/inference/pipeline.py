@@ -78,6 +78,7 @@ VLM_TEXT_PROMPT = (
     "from the following product listing. Return ONLY valid JSON with these "
     "exact keys: primary_color, secondary_color, primary_material, "
     "secondary_material, style, shape, assembly. Use null for unknown.\n\n"
+    "Important: primary color, secondary color can not be same which means its a single color, same for material\n\n"
     f"{VOCAB_CONTEXT}\n\n"
     "{{input_text}}\n\nExtracted attributes (JSON):"
 )
@@ -88,6 +89,7 @@ VLM_IMAGE_PROMPT = (
     "the image and the text. Return ONLY valid JSON with these exact keys: "
     "primary_color, secondary_color, primary_material, secondary_material, "
     "style, shape, assembly. Use null for unknown.\n\n"
+    "Important: primary color, secondary color can not be same which means its a single color, same for material\n\n"
     f"{VOCAB_CONTEXT}\n\n"
     "<image>\n{{input_text}}\n\nExtracted attributes (JSON):"
 )
