@@ -1,4 +1,4 @@
-# Wayfair Product Intelligence Platform
+# Product Intelligence Platform
 
 A multimodal ML system for automated product classification, attribute extraction, and search relevance ranking. Built on Wayfair's 42K+ product catalog with images, structured metadata, and hierarchical taxonomy.
 
